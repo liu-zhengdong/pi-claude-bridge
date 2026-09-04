@@ -1,0 +1,46 @@
+name: upstream-sync
+
+# Keeps @schuettc/pi-claude-bridge current with upstream elidickinson/pi-claude-bridge.
+# Daily (and on demand): rebase our patch stack onto upstream/main. If it applies
+# cleanly, compute the next <upstream-base>-schuettc.N version and publish it to npm
+# via OIDC trusted publishing (no stored token). If the rebase conflicts, publish
+# nothing and open an issue for manual resolution.
+
+on:
+  schedule:
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Publish current state even if not behind upstream"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+  id-token: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: schuettc-publish
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - name: Upgrade npm (OIDC trusted publishing needs >= 11.5.1)
+        run: npm install -g npm@latest
+      - name: Sync onto upstream and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+        run: bash .github/scripts/upstream-sync.sh "${FORCE:-false}"
