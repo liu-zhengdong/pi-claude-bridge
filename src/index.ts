@@ -895,6 +895,28 @@ function showStartupNoticeOnce(): void {
 // is keyed rather than held in a single slot.
 const promptCaptures = new PromptCaptures(256, (diagnostic) => {
 	const first = diagnostic.matches[0];
+	// A prompt that shares a long prefix with a known key but still resolves against
+	// nothing is a pi assembly that drifted after we recorded it — the subagent-
+	// inheritance failure that ships pi's harness as a verbatim side request and trips
+	// the server's third-party plan-eligibility check ("out of extra usage"). Persist
+	// those unconditionally (diagDump ignores CLAUDE_BRIDGE_DEBUG) so a recurrence leaves
+	// a trace to ground the next fix on. Foreign one-shot prompts — a judge or reviewer's
+	// own rubric served as a side request — diverge near offset 0 and stay on the
+	// debug-only path, so this file holds only the failures that matter.
+	if (first !== undefined && first.firstDivergent >= 2000) {
+		try {
+			diagDump("prompt-capture-no-match", {
+				unresolvedLen: diagnostic.systemPrompt.length,
+				knownKeys: diagnostic.matches.length,
+				closestKeyLen: first.key.length,
+				firstDivergent: first.firstDivergent,
+				unresolvedAtDivergence: diagnostic.systemPrompt.slice(first.firstDivergent - 60, first.firstDivergent + 160),
+				closestAtDivergence: first.key.slice(first.firstDivergent - 60, first.firstDivergent + 160),
+			});
+		} catch {
+			// Best-effort: a diagnostic write must never mask the resolver's own throw.
+		}
+	}
 	debug(
 		`prompt-capture: no match for ${diagnostic.systemPrompt.length}-char system prompt. `
 		+ (first
@@ -2209,6 +2231,18 @@ export default function (pi: ExtensionAPI) {
 	// and ships pi's harness — tripping the server's third-party plan-eligibility check
 	// ("out of extra usage"). Recording it here, before the query, restores the match.
 	pi.on("agent_start", (_event, ctx) => {
+		recordSystemPrompt(ctx.getSystemPrompt(), lastSystemPromptOptions);
+	});
+	// agent_start records the widened prompt at the top of a turn, but pi keeps
+	// rebuilding it mid-turn as MCP servers finish connecting — so the prompt
+	// pi-subagents reads via ctx.getSystemPrompt() when it dispatches a subagent (at the
+	// Agent tool_call) can be wider than what agent_start captured. When it is, the child
+	// embeds a prompt that matches no capture key, resolves against nothing, and ships
+	// pi's harness as a verbatim side request — the same "out of extra usage" 400.
+	// Re-recording at every tool_call captures that later snapshot, so the bytes a
+	// subagent embeds are always a key. Idempotent: record() dedupes by prompt, and the
+	// handler returns void so it never alters the tool call.
+	pi.on("tool_call", (_event, ctx) => {
 		recordSystemPrompt(ctx.getSystemPrompt(), lastSystemPromptOptions);
 	});
 	pi.on("session_shutdown", () => {
