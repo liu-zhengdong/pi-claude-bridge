@@ -18,7 +18,7 @@ const shownSoftWarnings = new Set<UsageProviderV1>();
 const ignoredForkMarkers = new Map<UsageProviderV1, number>();
 
 function isUsageProvider(value: unknown): value is UsageProviderV1 {
-	return value === "anthropic" || value === "codex";
+	return value === "claude" || value === "codex";
 }
 
 function validMarkerCounts(ctx: SessionEntriesContext): Map<UsageProviderV1, number> {

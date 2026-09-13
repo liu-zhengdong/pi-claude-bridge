@@ -3,22 +3,36 @@
 // Keep this file dependency-free at runtime: pi-usage and the bridge discover one
 // another exclusively through the global symbol, regardless of load order.
 
-export type UsageProviderV1 = "anthropic" | "codex";
-export type UsageScopeV1 = { kind: "account" } | { kind: "model"; modelIds: string[]; label: string };
+export type ProviderKeyV1 = "claude" | "codex";
+export type UsageProviderV1 = ProviderKeyV1;
+export type UsageStateV1 = "available" | "warning" | "rejected" | "unknown";
+export type UsageScopeV1 =
+	| { kind: "account" }
+	| { kind: "model"; modelIds: string[]; label: string }
+	| { kind: "overage" }
+	| { kind: "provider"; id: string; label?: string };
 
 export type NormalizedUsageWindow = {
 	id: string;
 	label: string;
-	usedPercent: number;
+	usedPercent?: number;
 	resetsAt?: number;
 	windowMinutes?: number;
 	scope: UsageScopeV1;
+	state?: UsageStateV1;
+	usedAmount?: number;
+	limitAmount?: number;
+	currency?: string;
 };
 
 export type ProviderUsageSnapshotV1 = {
 	version: 1;
-	provider: "anthropic" | "codex";
+	provider: ProviderKeyV1;
+	providerLabel?: string;
+	source: string;
 	capturedAt: number;
+	complete: boolean;
+	adapterId?: string;
 	windows: NormalizedUsageWindow[];
 };
 
@@ -27,21 +41,21 @@ export type ProviderUsageEventV1 =
 	| {
 		version: 1;
 		type: "soft-warning";
-		provider: "anthropic" | "codex";
+		provider: ProviderKeyV1;
 		message: string;
 		snapshot?: ProviderUsageSnapshotV1;
 	}
 	| {
 		version: 1;
 		type: "hard-limit";
-		provider: "anthropic" | "codex";
+		provider: ProviderKeyV1;
 		message: string;
 		snapshot?: ProviderUsageSnapshotV1;
 	};
 
 export type ProviderUsageAdapterV1 = {
 	id: string;
-	usageProvider: "anthropic" | "codex";
+	usageProvider: ProviderKeyV1;
 	modelProviders: string[];
 	refresh(options: { timeoutMs: number; signal?: AbortSignal }): Promise<ProviderUsageSnapshotV1>;
 };
@@ -87,6 +101,7 @@ function createUsageBusV1(): ProviderUsageBusV1 {
 	return {
 		version: 1,
 		register(adapter) {
+			if (!isValidAdapter(adapter)) return () => {};
 			const registration = Symbol(adapter.id);
 			adaptersById.set(adapter.id, { adapter, registration });
 			return () => {
@@ -97,12 +112,14 @@ function createUsageBusV1(): ProviderUsageBusV1 {
 			return [...adaptersById.values()].map(({ adapter }) => adapter);
 		},
 		subscribe(listener) {
+			if (typeof listener !== "function") return () => {};
 			listeners.add(listener);
 			return () => {
 				listeners.delete(listener);
 			};
 		},
 		publish(event) {
+			if (!isValidEvent(event)) return 0;
 			let invoked = 0;
 			for (const listener of [...listeners]) {
 				invoked += 1;
@@ -115,6 +132,93 @@ function createUsageBusV1(): ProviderUsageBusV1 {
 			return invoked;
 		},
 	};
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function nonEmptyString(value: unknown): value is string {
+	return typeof value === "string" && value.trim().length > 0;
+}
+
+function finiteNumberValue(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value);
+}
+
+function finiteNonNegative(value: unknown): value is number {
+	return finiteNumberValue(value) && value >= 0;
+}
+
+function isProvider(value: unknown): value is ProviderKeyV1 {
+	return value === "claude" || value === "codex";
+}
+
+function isState(value: unknown): value is UsageStateV1 {
+	return value === "available" || value === "warning" || value === "rejected" || value === "unknown";
+}
+
+function isScope(value: unknown): value is UsageScopeV1 {
+	if (!isRecord(value)) return false;
+	if (value.kind === "account" || value.kind === "overage") return true;
+	if (value.kind === "model") {
+		return (
+			nonEmptyString(value.label) &&
+			Array.isArray(value.modelIds) &&
+			value.modelIds.length > 0 &&
+			value.modelIds.every(nonEmptyString)
+		);
+	}
+	return value.kind === "provider" && nonEmptyString(value.id) && (value.label === undefined || nonEmptyString(value.label));
+}
+
+function isWindow(value: unknown): value is NormalizedUsageWindow {
+	if (!isRecord(value) || !nonEmptyString(value.id) || !nonEmptyString(value.label) || !isScope(value.scope)) return false;
+	if (value.usedPercent !== undefined && !finiteNumberValue(value.usedPercent)) return false;
+	if (value.resetsAt !== undefined && !finiteNonNegative(value.resetsAt)) return false;
+	if (value.windowMinutes !== undefined && (!finiteNonNegative(value.windowMinutes) || value.windowMinutes === 0)) return false;
+	if (value.state !== undefined && !isState(value.state)) return false;
+	if (value.usedAmount !== undefined && !finiteNonNegative(value.usedAmount)) return false;
+	if (value.limitAmount !== undefined && !finiteNonNegative(value.limitAmount)) return false;
+	return value.currency === undefined || nonEmptyString(value.currency);
+}
+
+function isValidSnapshot(value: unknown): value is ProviderUsageSnapshotV1 {
+	return (
+		isRecord(value) &&
+		value.version === 1 &&
+		isProvider(value.provider) &&
+		(value.providerLabel === undefined || nonEmptyString(value.providerLabel)) &&
+		nonEmptyString(value.source) &&
+		finiteNonNegative(value.capturedAt) &&
+		typeof value.complete === "boolean" &&
+		(value.adapterId === undefined || nonEmptyString(value.adapterId)) &&
+		Array.isArray(value.windows) &&
+		value.windows.every(isWindow)
+	);
+}
+
+function isValidAdapter(value: unknown): value is ProviderUsageAdapterV1 {
+	return (
+		isRecord(value) &&
+		nonEmptyString(value.id) &&
+		isProvider(value.usageProvider) &&
+		Array.isArray(value.modelProviders) &&
+		value.modelProviders.length > 0 &&
+		value.modelProviders.every(nonEmptyString) &&
+		typeof value.refresh === "function"
+	);
+}
+
+function isValidEvent(value: unknown): value is ProviderUsageEventV1 {
+	if (!isRecord(value) || value.version !== 1) return false;
+	if (value.type === "snapshot") return isValidSnapshot(value.snapshot);
+	return (
+		(value.type === "soft-warning" || value.type === "hard-limit") &&
+		isProvider(value.provider) &&
+		nonEmptyString(value.message) &&
+		(value.snapshot === undefined || (isValidSnapshot(value.snapshot) && value.snapshot.provider === value.provider))
+	);
 }
 
 const ACCOUNT_WINDOWS: Record<string, { label: string; windowMinutes?: number; scope?: UsageScopeV1 }> = {
@@ -148,10 +252,6 @@ const MODEL_IDS_BY_BUCKET: Record<string, string[]> = {
 	haiku: ["claude-haiku-4-5"],
 };
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 function finiteNumber(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
@@ -184,20 +284,29 @@ function normalizeWindow(
 	value: unknown,
 	scope: UsageScopeV1,
 	windowMinutes?: number,
+	state?: UsageStateV1,
 ): NormalizedUsageWindow | undefined {
 	if (!isRecord(value)) return undefined;
 	const utilization = finiteNumber(value.utilization);
-	if (utilization === undefined) return undefined;
 	const resetsAt = epochSeconds(value.resets_at);
+	if (utilization === undefined && resetsAt === undefined && state === undefined) return undefined;
 	return {
 		id,
 		label,
-		usedPercent: clampPercent(utilization),
+		...(utilization === undefined ? {} : { usedPercent: clampPercent(utilization) }),
 		...(resetsAt === undefined ? {} : { resetsAt }),
 		...(windowMinutes === undefined ? {} : { windowMinutes }),
+		...(state === undefined ? {} : { state }),
 		scope,
 	};
 }
+
+const SNAPSHOT_BASE = {
+	version: 1,
+	provider: "claude",
+	providerLabel: "Claude",
+	adapterId: "schuettc.pi-claude-bridge",
+} as const;
 
 /** Normalize the rate-limit section returned by the Agent SDK's usage control. */
 export function snapshotFromClaudeUsage(payload: unknown, capturedAt = Date.now()): ProviderUsageSnapshotV1 {
@@ -222,9 +331,8 @@ export function snapshotFromClaudeUsage(payload: unknown, capturedAt = Date.now(
 		for (const value of rateLimits.model_scoped) {
 			if (!isRecord(value) || typeof value.display_name !== "string" || value.display_name.trim() === "") continue;
 			const displayName = value.display_name.trim();
-			const bucketSlug = slug(displayName);
 			const window = normalizeWindow(
-				`model_scoped:${bucketSlug}`,
+				`model_scoped:${slug(displayName)}`,
 				"7d",
 				value,
 				{ kind: "model", modelIds: modelIdsForBucket(displayName), label: displayName },
@@ -234,45 +342,85 @@ export function snapshotFromClaudeUsage(payload: unknown, capturedAt = Date.now(
 		}
 	}
 
-	const extraUsage = normalizeWindow(
-		"extra_usage",
-		"Monthly extra usage",
-		rateLimits.extra_usage,
-		{ kind: "account" },
-	);
-	if (extraUsage) windows.push(extraUsage);
+	if (isRecord(rateLimits.extra_usage)) {
+		const extra = rateLimits.extra_usage;
+		const utilization = finiteNumber(extra.utilization);
+		const usedCredits = finiteNumber(extra.used_credits);
+		const monthlyLimit = finiteNumber(extra.monthly_limit);
+		const currency = typeof extra.currency === "string" && extra.currency.trim() ? extra.currency : undefined;
+		const enabled = typeof extra.is_enabled === "boolean" ? extra.is_enabled : undefined;
+		if (utilization !== undefined || usedCredits !== undefined || monthlyLimit !== undefined || currency || enabled !== undefined) {
+			windows.push({
+				id: "extra_usage",
+				label: "overage",
+				...(utilization === undefined ? {} : { usedPercent: clampPercent(utilization) }),
+				...(enabled === undefined ? {} : { state: enabled ? "available" : "unknown" }),
+				...(usedCredits === undefined ? {} : { usedAmount: usedCredits / 100 }),
+				...(monthlyLimit === undefined ? {} : { limitAmount: monthlyLimit / 100 }),
+				...(currency === undefined ? {} : { currency }),
+				scope: { kind: "overage" },
+			});
+		}
+	}
 
-	return { version: 1, provider: "anthropic", capturedAt, windows };
+	return { ...SNAPSHOT_BASE, source: "claude-code-sdk", capturedAt, complete: true, windows };
 }
 
 /** Build the partial snapshot carried by an SDK rate_limit_event. */
 export function snapshotFromClaudeRateLimitInfo(info: unknown, capturedAt = Date.now()): ProviderUsageSnapshotV1 | undefined {
-	if (!isRecord(info) || typeof info.rateLimitType !== "string") return undefined;
-	const utilization = finiteNumber(info.utilization);
-	if (utilization === undefined) return undefined;
+	if (!isRecord(info) || typeof info.rateLimitType !== "string" || info.rateLimitType.trim() === "") return undefined;
 	const type = info.rateLimitType;
 	const metadata = ACCOUNT_WINDOWS[type] ?? { label: type.replaceAll("_", " ") };
+	const utilization = finiteNumber(info.utilization);
 	const resetsAt = finiteNumber(info.resetsAt);
+	const state =
+		info.status === "allowed_warning"
+			? "warning"
+			: info.status === "rejected"
+				? "rejected"
+				: info.status === "allowed"
+					? "available"
+					: undefined;
+	if (utilization === undefined && resetsAt === undefined && state === undefined) return undefined;
 	const window: NormalizedUsageWindow = {
 		id: type,
 		label: metadata.label,
-		usedPercent: clampPercent(utilization * 100),
+		...(utilization === undefined ? {} : { usedPercent: clampPercent(utilization * 100) }),
 		...(resetsAt === undefined ? {} : { resetsAt }),
 		...(metadata.windowMinutes === undefined ? {} : { windowMinutes: metadata.windowMinutes }),
+		...(state === undefined ? {} : { state }),
 		scope: metadata.scope ?? { kind: "account" },
 	};
-	return { version: 1, provider: "anthropic", capturedAt, windows: [window] };
+	return {
+		...SNAPSHOT_BASE,
+		source: "claude-code-sdk-rate-limit-event",
+		capturedAt,
+		complete: false,
+		windows: [window],
+	};
 }
 
 export function publishProviderUsage(event: ProviderUsageEventV1): number {
-	return getUsageBusV1().publish(event);
+	if (!isValidEvent(event)) return 0;
+	try {
+		return getUsageBusV1().publish(event);
+	} catch {
+		return 0;
+	}
 }
 
 export function registerClaudeUsageAdapter(refresh: ProviderUsageAdapterV1["refresh"]): () => void {
-	return getUsageBusV1().register({
+	const adapter: ProviderUsageAdapterV1 = {
 		id: "schuettc.pi-claude-bridge",
-		usageProvider: "anthropic",
+		usageProvider: "claude",
 		modelProviders: ["claude-bridge"],
 		refresh,
-	});
+	};
+	if (!isValidAdapter(adapter)) return () => {};
+	try {
+		const unregister = getUsageBusV1().register(adapter);
+		return typeof unregister === "function" ? unregister : () => {};
+	} catch {
+		return () => {};
+	}
 }
