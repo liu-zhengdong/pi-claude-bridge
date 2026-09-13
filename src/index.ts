@@ -35,7 +35,6 @@ import {
 	type ProviderUsageEventV1,
 } from "./usage-bus.js";
 import {
-	noteStandaloneWarningHandledByListener,
 	notifyWithStandaloneSessionPolicy,
 	resetStandaloneWarningState,
 	restoreStandaloneWarningState,
@@ -853,6 +852,7 @@ export const __test = {
 	finalizeCurrentStream,
 	resultErrorText,
 	refreshClaudeUsage,
+	setUsageControlQuery: setUsageControlQueryForTest,
 	beginStandaloneWarningSession,
 	deliverToolResults,
 	drainForAbort,
@@ -936,9 +936,10 @@ function beginStandaloneWarningSession(
 ): void {
 	standaloneWarningContext = {
 		appendEntry: (customType, data) => { pi.appendEntry(customType, data); },
+		sessionManager: ctx.sessionManager,
 		ui: ctx.ui,
 	};
-	if (fork) resetStandaloneWarningState();
+	if (fork) resetStandaloneWarningState(ctx);
 	else restoreStandaloneWarningState(ctx);
 }
 
@@ -1121,6 +1122,51 @@ type UsageRefreshDependencies = {
 	provider: NonNullable<Config["provider"]>;
 };
 
+type ClaudeUsageAdapterOwner = {
+	dependencies?: UsageRefreshDependencies;
+	ready: Promise<UsageRefreshDependencies>;
+	resolveReady(dependencies: UsageRefreshDependencies): void;
+};
+
+let claudeUsageAdapterOwner: ClaudeUsageAdapterOwner | undefined;
+let usageControlQuery: UsageRefreshDependencies["query"] = query;
+
+function createClaudeUsageAdapterOwner(): ClaudeUsageAdapterOwner {
+	let resolveReady!: (dependencies: UsageRefreshDependencies) => void;
+	const owner: ClaudeUsageAdapterOwner = {
+		ready: new Promise((resolve) => { resolveReady = resolve; }),
+		resolveReady,
+	};
+	claudeUsageAdapterOwner = owner;
+	return owner;
+}
+
+function bindClaudeUsageAdapterOwner(owner: ClaudeUsageAdapterOwner, ctx: Pick<ExtensionContext, "cwd" | "sessionManager">): void {
+	if (claudeUsageAdapterOwner !== owner) return;
+	const sessionId = ctx.sessionManager?.getSessionId?.();
+	// ExtensionContext always supplies cwd; the fallback keeps legacy minimal
+	// test doubles from failing before they reach the behavior they exercise.
+	const cwd = ctx.cwd ?? process.cwd();
+	const dependencies: UsageRefreshDependencies = {
+		query: usageControlQuery,
+		cwd,
+		env: childEnv(process.env, sessionId),
+		provider: { ...(loadConfig(cwd).provider ?? {}) },
+	};
+	owner.dependencies = dependencies;
+	owner.resolveReady(dependencies);
+}
+
+function clearClaudeUsageAdapterOwner(owner: ClaudeUsageAdapterOwner): void {
+	if (claudeUsageAdapterOwner !== owner) return;
+	owner.dependencies = undefined;
+	claudeUsageAdapterOwner = undefined;
+}
+
+function setUsageControlQueryForTest(factory?: UsageRefreshDependencies["query"]): void {
+	usageControlQuery = factory ?? query;
+}
+
 async function* emptyUsagePrompt(): AsyncGenerator<never, void, unknown> {
 	// Account refresh uses the control protocol only. Yielding even one message
 	// would turn this into a model request and consume completion tokens.
@@ -1131,18 +1177,20 @@ async function* emptyUsagePrompt(): AsyncGenerator<never, void, unknown> {
 async function refreshClaudeUsage(
 	options: Parameters<ProviderUsageAdapterV1["refresh"]>[0],
 	injected?: UsageRefreshDependencies,
+	owner = claudeUsageAdapterOwner,
 ) {
-	const dependencies: UsageRefreshDependencies = injected ?? {
-		query,
-		cwd: process.cwd(),
-		env: childEnv(process.env, piSessionId),
-		provider: providerSettings,
-	};
 	const abortController = new AbortController();
-	let timedOut = false;
 	const timeoutMs = Math.max(0, options.timeoutMs);
+	let removeAbortRejection: (() => void) | undefined;
+	const aborted = new Promise<never>((_resolve, reject) => {
+		const onAbort = () => {
+			const reason = abortController.signal.reason;
+			reject(reason instanceof Error ? reason : new Error("Claude usage refresh aborted."));
+		};
+		abortController.signal.addEventListener("abort", onAbort, { once: true });
+		removeAbortRejection = () => abortController.signal.removeEventListener("abort", onAbort);
+	});
 	const timeout = setTimeout(() => {
-		timedOut = true;
 		abortController.abort(new Error(`Claude usage refresh timeout after ${timeoutMs}ms.`));
 	}, timeoutMs);
 	const onCallerAbort = () => abortController.abort(options.signal?.reason);
@@ -1150,8 +1198,14 @@ async function refreshClaudeUsage(
 	else options.signal?.addEventListener("abort", onCallerAbort, { once: true });
 
 	let sdkQuery: UsageControlQuery | undefined;
-	let removeAbortRejection: (() => void) | undefined;
 	try {
+		if (abortController.signal.aborted) {
+			throw abortController.signal.reason instanceof Error
+				? abortController.signal.reason
+				: new Error("Claude usage refresh aborted.");
+		}
+		if (!injected && !owner) throw new Error("Claude usage refresh is not bound to a session.");
+		const dependencies = injected ?? owner?.dependencies ?? await Promise.race([owner!.ready, aborted]);
 		if (abortController.signal.aborted) {
 			throw abortController.signal.reason instanceof Error
 				? abortController.signal.reason
@@ -1181,16 +1235,6 @@ async function refreshClaudeUsage(
 			},
 		});
 
-		const aborted = new Promise<never>((_resolve, reject) => {
-			const onAbort = () => {
-				const reason = abortController.signal.reason;
-				reject(reason instanceof Error
-					? reason
-					: new Error(timedOut ? `Claude usage refresh timeout after ${timeoutMs}ms.` : "Claude usage refresh aborted."));
-			};
-			abortController.signal.addEventListener("abort", onAbort, { once: true });
-			removeAbortRejection = () => abortController.signal.removeEventListener("abort", onAbort);
-		});
 		const payload = await Promise.race([
 			sdkQuery.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET({ skipBehaviors: true }),
 			aborted,
@@ -1563,8 +1607,7 @@ async function consumeQuery(
 				...(snapshot ? { snapshot } : {}),
 			};
 			const listeners = publishProviderUsage(event);
-			if (listeners > 0) noteStandaloneWarningHandledByListener(event);
-			else if (standaloneWarningContext) notifyWithStandaloneSessionPolicy(event, standaloneWarningContext);
+			if (listeners === 0 && standaloneWarningContext) notifyWithStandaloneSessionPolicy(event, standaloneWarningContext);
 			continue;
 		}
 		if (!queryCtx.currentPiStream || !queryCtx.turnOutput) continue;
@@ -2335,9 +2378,14 @@ export default function (pi: ExtensionAPI) {
 	const registeredModels = applyLongContext(MODELS, longContextSettings);
 
 	let ownsUsageAdapter = false;
+	let ownedUsageAdapterOwner: ClaudeUsageAdapterOwner | undefined;
 	const ensureUsageAdapter = () => {
 		if (unregisterClaudeUsageAdapter) return;
-		unregisterClaudeUsageAdapter = registerClaudeUsageAdapter(refreshClaudeUsage);
+		const owner = createClaudeUsageAdapterOwner();
+		unregisterClaudeUsageAdapter = registerClaudeUsageAdapter(
+			(options) => refreshClaudeUsage(options, undefined, owner),
+		);
+		ownedUsageAdapterOwner = owner;
 		ownsUsageAdapter = true;
 	};
 	ensureUsageAdapter();
@@ -2365,19 +2413,17 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", (event, ctx) => {
 		piUI = ctx.ui;
 		piMode = ctx.mode;
-		// A later startup belongs to an in-process child. Warning UI and markers
-		// remain owned by the first/top-level session so reentrant provider calls
-		// share one durable allowance.
-		const isTopLevelSessionStart = event.reason !== "startup" || piSessionId === undefined;
-		if (isTopLevelSessionStart) {
-			ensureUsageAdapter();
+		// The factory that registered the singleton adapter owns its session state.
+		// Later in-process child factories share this module but cannot rebind it.
+		if (ownsUsageAdapter && ownedUsageAdapterOwner) {
+			bindClaudeUsageAdapterOwner(ownedUsageAdapterOwner, ctx);
 			beginStandaloneWarningSession(pi, ctx, event.reason === "fork");
 			ownsStandaloneWarningSession = true;
 		}
 		// Capture the top-level session only (see piSessionId above): "new",
 		// "resume" and "fork" each mint a new top-level id, while "startup" is
-		// captured only when nothing is held yet — the process's first startup.
-		// A later "startup" is an in-process child session and must not overwrite.
+		// captured only when nothing is held yet. This existing process-wide state
+		// is separate from the adapter's owner-bound refresh dependencies above.
 		if (event.reason === "new" || event.reason === "resume" || event.reason === "fork" || piSessionId === undefined) {
 			const sessionId = ctx.sessionManager?.getSessionId?.();
 			if (sessionId) piSessionId = sessionId;
@@ -2448,6 +2494,8 @@ export default function (pi: ExtensionAPI) {
 		if (ownsUsageAdapter) {
 			unregisterClaudeUsageAdapter?.();
 			unregisterClaudeUsageAdapter = undefined;
+			if (ownedUsageAdapterOwner) clearClaudeUsageAdapterOwner(ownedUsageAdapterOwner);
+			ownedUsageAdapterOwner = undefined;
 			ownsUsageAdapter = false;
 		}
 		// Not in clearSession: that also runs on session_start, and a live session

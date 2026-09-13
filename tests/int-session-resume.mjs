@@ -20,9 +20,6 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRpcHarness, requireEnv } from "./lib/rpc-harness.mjs";
 
-const OTHER_PROVIDER = requireEnv("CLAUDE_BRIDGE_TESTING_ALT_PROVIDER");
-const OTHER_MODEL = requireEnv("CLAUDE_BRIDGE_TESTING_ALT_MODEL");
-
 const TIMEOUT = 180_000;
 const BRIDGE_MODEL = "claude-bridge/claude-haiku-4-5";
 
@@ -136,6 +133,11 @@ if (forkedWarnings.notifications.length !== 1 || forkedWarnings.markers.length !
 	throw new Error(`fork did not receive a fresh warning allowance: ${JSON.stringify(forkedWarnings)}`);
 }
 console.log("  warning lifecycle PASS");
+
+// Everything above is deterministic and completion-free. Gate only the live
+// provider continuation checks below on external provider credentials.
+const OTHER_PROVIDER = requireEnv("CLAUDE_BRIDGE_TESTING_ALT_PROVIDER");
+const OTHER_MODEL = requireEnv("CLAUDE_BRIDGE_TESTING_ALT_MODEL");
 
 // Use harness but with custom args - start on non-provider model
 const harness = createRpcHarness({
