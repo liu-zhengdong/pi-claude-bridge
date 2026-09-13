@@ -1593,17 +1593,22 @@ async function consumeQuery(
 				// Held so the failure Claude Code sends next can be named as a rate limit.
 				queryCtx.rateLimitRejection = info;
 			}
-			const percent = Math.round((info.utilization ?? 0) * 100);
+			const utilization = typeof info.utilization === "number" && Number.isFinite(info.utilization)
+				? Math.round(info.utilization * 100)
+				: undefined;
 			// resetsAt is Unix seconds, not milliseconds.
 			const resetsAt = info.resetsAt ? new Date(info.resetsAt * 1000).toLocaleTimeString() : "unknown";
+			const rateLimitType = info.rateLimitType ?? "unknown";
 			const event: Exclude<ProviderUsageEventV1, { type: "snapshot" }> = {
 				version: 1,
 				type: info.status === "rejected" ? "hard-limit" : "soft-warning",
-				provider: "anthropic",
+				provider: "claude",
 				message:
 					info.status === "rejected"
-						? `Claude rate limited (${info.rateLimitType ?? "unknown"}) — resets at ${resetsAt}`
-						: `Claude rate limit warning: ${percent}% used (${info.rateLimitType ?? "unknown"})`,
+						? `Claude rate limited (${rateLimitType}) — resets at ${resetsAt}`
+						: utilization === undefined
+							? `Claude rate limit warning (${rateLimitType})`
+							: `Claude rate limit warning: ${utilization}% used (${rateLimitType})`,
 				...(snapshot ? { snapshot } : {}),
 			};
 			const listeners = publishProviderUsage(event);

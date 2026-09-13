@@ -80,7 +80,7 @@ describe("Claude provider usage protocol", () => {
 		const snapshot = usageBus.snapshotFromClaudeUsage(ACCOUNT_USAGE, capturedAt);
 
 		assert.equal(snapshot.version, 1);
-		assert.equal(snapshot.provider, "anthropic");
+		assert.equal(snapshot.provider, "claude");
 		assert.equal(snapshot.capturedAt, capturedAt);
 		assert.deepEqual(snapshot.windows.slice(0, 2), [
 			{
@@ -112,6 +112,63 @@ describe("Claude provider usage protocol", () => {
 		});
 	});
 
+	it("emits the complete canonical Claude fixture including Fable and overage values", () => {
+		const snapshot = usageBus.snapshotFromClaudeUsage({
+			...ACCOUNT_USAGE,
+			rate_limits: {
+				...ACCOUNT_USAGE.rate_limits,
+				extra_usage: {
+					is_enabled: true,
+					used_credits: 800,
+					monthly_limit: 10_000,
+					utilization: 8,
+					currency: "USD",
+				},
+			},
+		}, Date.parse("2026-09-13T01:00:00.000Z"));
+
+		assert.equal(snapshot.provider, "claude");
+		assert.equal(snapshot.providerLabel, "Claude");
+		assert.equal(snapshot.source, "claude-code-sdk");
+		assert.equal(snapshot.complete, true);
+		assert.equal(snapshot.adapterId, "schuettc.pi-claude-bridge");
+		assert.deepEqual(snapshot.windows.find((window) => window.scope.kind === "overage"), {
+			id: "extra_usage",
+			label: "overage",
+			usedPercent: 8,
+			state: "available",
+			usedAmount: 8,
+			limitAmount: 100,
+			currency: "USD",
+			scope: { kind: "overage" },
+		});
+	});
+
+	it("partial passive snapshots carry adapter identity and only supplied fields", () => {
+		const withoutUtilization = usageBus.snapshotFromClaudeRateLimitInfo({
+			status: "allowed_warning",
+			rateLimitType: "five_hour",
+			resetsAt: 1_800_000_000,
+		});
+		assert.deepEqual(withoutUtilization, {
+			version: 1,
+			provider: "claude",
+			providerLabel: "Claude",
+			source: "claude-code-sdk-rate-limit-event",
+			capturedAt: withoutUtilization.capturedAt,
+			complete: false,
+			adapterId: "schuettc.pi-claude-bridge",
+			windows: [{
+				id: "five_hour",
+				label: "5h",
+				resetsAt: 1_800_000_000,
+				windowMinutes: 300,
+				state: "warning",
+				scope: { kind: "account" },
+			}],
+		});
+	});
+
 	it("registers the structural adapter when the bridge creates the bus", () => {
 		clearBus();
 		const refresh = async () => usageBus.snapshotFromClaudeUsage(ACCOUNT_USAGE);
@@ -122,7 +179,7 @@ describe("Claude provider usage protocol", () => {
 		assert.deepEqual(bus.adapters().map(({ id, usageProvider, modelProviders }) => ({ id, usageProvider, modelProviders })), [
 			{
 				id: "schuettc.pi-claude-bridge",
-				usageProvider: "anthropic",
+				usageProvider: "claude",
 				modelProviders: ["claude-bridge"],
 			},
 		]);
@@ -269,10 +326,39 @@ describe("Claude provider usage protocol", () => {
 
 		assert.strictEqual(globalThis[BUS_SYMBOL], existing);
 		assert.equal(adapter.id, "schuettc.pi-claude-bridge");
-		assert.equal(adapter.usageProvider, "anthropic");
+		assert.equal(adapter.usageProvider, "claude");
 		assert.deepEqual(adapter.modelProviders, ["claude-bridge"]);
 		unregister();
 		assert.equal(removed, true);
+	});
+
+	it("fails open when an optional registry is incompatible or throws", () => {
+		clearBus();
+		globalThis[BUS_SYMBOL] = { version: 2 };
+		assert.doesNotThrow(() => usageBus.registerClaudeUsageAdapter(async () => ({})));
+		assert.equal(usageBus.publishProviderUsage({ version: 1, type: "snapshot", snapshot: {} }), 0);
+
+		globalThis[BUS_SYMBOL] = {
+			version: 1,
+			register() { throw new Error("register failed"); },
+			adapters() { return []; },
+			subscribe() { return () => {}; },
+			publish() { throw new Error("publish failed"); },
+		};
+		assert.doesNotThrow(() => usageBus.registerClaudeUsageAdapter(async () => ({})));
+		assert.equal(usageBus.publishProviderUsage({ version: 1, type: "snapshot", snapshot: {} }), 0);
+	});
+
+	it("runtime validation drops malformed adapters and events", () => {
+		clearBus();
+		const bus = usageBus.getUsageBusV1();
+		let calls = 0;
+		bus.subscribe(() => calls++);
+		bus.register({ id: "", usageProvider: "claude", modelProviders: ["claude-bridge"], refresh: async () => ({}) });
+		assert.deepEqual(bus.adapters(), []);
+		assert.equal(bus.publish({ version: 1, type: "soft-warning", provider: "anthropic", message: "bad" }), 0);
+		assert.equal(bus.publish({ version: 1, type: "snapshot", snapshot: { version: 1 } }), 0);
+		assert.equal(calls, 0);
 	});
 
 	it("refresh invokes only the SDK usage control with an empty prompt and closes", async () => {
@@ -319,7 +405,7 @@ describe("Claude provider usage protocol", () => {
 		assert.equal(streamReads, 0);
 		assert.equal(closeCalls, 1);
 		assert.equal(snapshot.version, 1);
-		assert.equal(snapshot.provider, "anthropic");
+		assert.equal(snapshot.provider, "claude");
 	});
 
 	it("refresh aborts on timeout and still closes the SDK query", async () => {
@@ -370,6 +456,23 @@ describe("Claude provider usage protocol", () => {
 		assert.equal(closeCalls, 1);
 	});
 
+	it("an allowed warning without utilization never invents zero percent", async () => {
+		clearBus();
+		const events = [];
+		const unsubscribe = usageBus.getUsageBusV1().subscribe((event) => events.push(event));
+		try {
+			await consume([{
+				type: "rate_limit_event",
+				rate_limit_info: { status: "allowed_warning", rateLimitType: "five_hour" },
+			}]);
+		} finally {
+			unsubscribe();
+		}
+		assert.equal(events.length, 1);
+		assert.equal(events[0].message, "Claude rate limit warning (five_hour)");
+		assert.equal(events[0].message.includes("0%"), false);
+	});
+
 	it("maps SDK statuses directly to snapshot, soft-warning, and hard-limit events", async () => {
 		clearBus();
 		const events = [];
@@ -405,8 +508,8 @@ describe("standalone provider warning policy", () => {
 			appendEntry(customType, data) { order.push("append"); entries.push({ customType, data }); },
 			ui: { notify(message, level) { order.push("notify"); notifications.push({ message, level }); } },
 		};
-		const first = { version: 1, type: "soft-warning", provider: "anthropic", message: "first" };
-		const second = { version: 1, type: "soft-warning", provider: "anthropic", message: "second" };
+		const first = { version: 1, type: "soft-warning", provider: "claude", message: "first" };
+		const second = { version: 1, type: "soft-warning", provider: "claude", message: "second" };
 
 		warningState.notifyWithStandaloneSessionPolicy(first, context);
 		warningState.notifyWithStandaloneSessionPolicy(second, context);
@@ -415,7 +518,7 @@ describe("standalone provider warning policy", () => {
 		assert.deepEqual(notifications, [{ message: "first", level: "warning" }]);
 		assert.equal(entries.length, 1);
 		assert.equal(entries[0].customType, "provider-usage:warning-v1");
-		assert.equal(entries[0].data.provider, "anthropic");
+		assert.equal(entries[0].data.provider, "claude");
 		assert.equal(typeof entries[0].data.shownAt, "number");
 	});
 
@@ -449,7 +552,7 @@ describe("standalone provider warning policy", () => {
 		const notifications = [];
 		const markers = [];
 		const sessionEntries = [
-			{ type: "custom", customType: "provider-usage:warning-v1", data: { provider: "anthropic", shownAt: 1 } },
+			{ type: "custom", customType: "provider-usage:warning-v1", data: { provider: "claude", shownAt: 1 } },
 		];
 		__test.beginStandaloneWarningSession(
 			{ appendEntry(customType, data) { markers.push({ customType, data }); } },
@@ -562,7 +665,7 @@ describe("standalone provider warning policy", () => {
 
 	it("validates restored markers, resets forks, and always shows hard limits", () => {
 		const inherited = [
-			{ type: "custom", customType: "provider-usage:warning-v1", data: { provider: "anthropic", shownAt: 1 } },
+			{ type: "custom", customType: "provider-usage:warning-v1", data: { provider: "claude", shownAt: 1 } },
 			{ type: "custom", customType: "provider-usage:warning-v1", data: { provider: "codex", shownAt: "bad" } },
 			{ type: "custom", customType: "provider-usage:warning-v1", data: { provider: "other", shownAt: 1 } },
 		];
@@ -574,20 +677,20 @@ describe("standalone provider warning policy", () => {
 		};
 		warningState.restoreStandaloneWarningState({ sessionManager: { getEntries: () => inherited } });
 		warningState.notifyWithStandaloneSessionPolicy(
-			{ version: 1, type: "soft-warning", provider: "anthropic", message: "restored" }, context,
+			{ version: 1, type: "soft-warning", provider: "claude", message: "restored" }, context,
 		);
 		warningState.notifyWithStandaloneSessionPolicy(
-			{ version: 1, type: "hard-limit", provider: "anthropic", message: "hard one" }, context,
+			{ version: 1, type: "hard-limit", provider: "claude", message: "hard one" }, context,
 		);
 		warningState.notifyWithStandaloneSessionPolicy(
-			{ version: 1, type: "hard-limit", provider: "anthropic", message: "hard two" }, context,
+			{ version: 1, type: "hard-limit", provider: "claude", message: "hard two" }, context,
 		);
 		assert.deepEqual(notifications, ["hard one", "hard two"]);
 		assert.deepEqual(entries, []);
 
 		warningState.resetStandaloneWarningState();
 		warningState.notifyWithStandaloneSessionPolicy(
-			{ version: 1, type: "soft-warning", provider: "anthropic", message: "fork allowance" }, context,
+			{ version: 1, type: "soft-warning", provider: "claude", message: "fork allowance" }, context,
 		);
 		assert.deepEqual(notifications, ["hard one", "hard two", "fork allowance"]);
 		assert.equal(entries.length, 1);
