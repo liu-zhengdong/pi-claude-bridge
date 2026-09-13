@@ -26,6 +26,21 @@ import {
 import { collectCarriedAttachments, placeCarriedAttachments, type CarriedAttachment } from "./attachments.js";
 import { createToolServer } from "./mcp-server.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
+import {
+	publishProviderUsage,
+	registerClaudeUsageAdapter,
+	snapshotFromClaudeRateLimitInfo,
+	snapshotFromClaudeUsage,
+	type ProviderUsageAdapterV1,
+	type ProviderUsageEventV1,
+} from "./usage-bus.js";
+import {
+	noteStandaloneWarningHandledByListener,
+	notifyWithStandaloneSessionPolicy,
+	resetStandaloneWarningState,
+	restoreStandaloneWarningState,
+	type StandaloneWarningContext,
+} from "./usage-warning-state.js";
 
 // Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
 const _piAi = piAi as any;
@@ -194,6 +209,11 @@ const ACTIVE_STREAM_SIMPLE_KEY = Symbol.for("claude-bridge:activeStreamSimple");
 // that skipped registration must not be able to unregister the parent's.
 const API_PROVIDER_SOURCE_ID = `claude-bridge:${moduleInstanceId}`;
 let registeredApiProvider = false;
+
+// Module-global for the same reason as ACTIVE_STREAM_SIMPLE_KEY: in-process child
+// extension instances share this module and must not replace or unregister the
+// top-level session's account-usage adapter.
+let unregisterClaudeUsageAdapter: (() => void) | undefined;
 
 // Claude Code's own builtin tools, for the AskClaude path where CC really runs
 // them. The provider path never sees these — it starts CC with `tools: []`.
@@ -832,6 +852,8 @@ export const __test = {
 	consumeQuery,
 	finalizeCurrentStream,
 	resultErrorText,
+	refreshClaudeUsage,
+	beginStandaloneWarningSession,
 	deliverToolResults,
 	drainForAbort,
 	CC_CHILD_ENV,
@@ -904,7 +926,21 @@ function mapToolArgs(
 // Global (not query state):
 let piUI: ExtensionUIContext | null = null;
 let piMode: ExtensionContext["mode"] | null = null;
+let standaloneWarningContext: StandaloneWarningContext | null = null;
 const activeQueryContexts = new Set<QueryContext>();
+
+function beginStandaloneWarningSession(
+	pi: Pick<ExtensionAPI, "appendEntry">,
+	ctx: Pick<ExtensionContext, "sessionManager" | "ui">,
+	fork: boolean,
+): void {
+	standaloneWarningContext = {
+		appendEntry: (customType, data) => { pi.appendEntry(customType, data); },
+		ui: ctx.ui,
+	};
+	if (fork) resetStandaloneWarningState();
+	else restoreStandaloneWarningState(ctx);
+}
 
 // Defaults that silently cost the user something (no Opus 1M on Max, no
 // AskClaude tool) are announced once. Deferred to the first bridge query rather
@@ -1072,6 +1108,101 @@ function buildMcpServers(tools: Tool[], queryCtx: QueryContext): Record<string, 
 }
 
 // --- Usage helpers ---
+
+type UsageControlQuery = {
+	usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET(options?: { skipBehaviors?: boolean }): Promise<unknown>;
+	close(): void;
+};
+
+type UsageRefreshDependencies = {
+	query(input: Parameters<typeof query>[0]): UsageControlQuery;
+	cwd: string;
+	env: Record<string, string | undefined>;
+	provider: NonNullable<Config["provider"]>;
+};
+
+async function* emptyUsagePrompt(): AsyncGenerator<never, void, unknown> {
+	// Account refresh uses the control protocol only. Yielding even one message
+	// would turn this into a model request and consume completion tokens.
+}
+
+/** Fetch subscription windows over the SDK control channel without creating a
+ * model turn. The injectable dependencies are only for contract tests. */
+async function refreshClaudeUsage(
+	options: Parameters<ProviderUsageAdapterV1["refresh"]>[0],
+	injected?: UsageRefreshDependencies,
+) {
+	const dependencies: UsageRefreshDependencies = injected ?? {
+		query,
+		cwd: process.cwd(),
+		env: childEnv(process.env, piSessionId),
+		provider: providerSettings,
+	};
+	const abortController = new AbortController();
+	let timedOut = false;
+	const timeoutMs = Math.max(0, options.timeoutMs);
+	const timeout = setTimeout(() => {
+		timedOut = true;
+		abortController.abort(new Error(`Claude usage refresh timeout after ${timeoutMs}ms.`));
+	}, timeoutMs);
+	const onCallerAbort = () => abortController.abort(options.signal?.reason);
+	if (options.signal?.aborted) onCallerAbort();
+	else options.signal?.addEventListener("abort", onCallerAbort, { once: true });
+
+	let sdkQuery: UsageControlQuery | undefined;
+	let removeAbortRejection: (() => void) | undefined;
+	try {
+		if (abortController.signal.aborted) {
+			throw abortController.signal.reason instanceof Error
+				? abortController.signal.reason
+				: new Error("Claude usage refresh aborted.");
+		}
+		const strictMcpConfig = dependencies.provider.strictMcpConfig !== false;
+		const claudeExecutable = dependencies.provider.pathToClaudeCodeExecutable;
+		sdkQuery = dependencies.query({
+			prompt: emptyUsagePrompt(),
+			options: {
+				cwd: dependencies.cwd,
+				env: dependencies.env,
+				abortController,
+				tools: [],
+				strictMcpConfig,
+				skills: [],
+				persistSession: false,
+				permissionMode: "bypassPermissions",
+				settings: {
+					...claudeCodeSettings(dependencies.provider),
+					claudeMdExcludes: CLAUDE_MD_EXCLUDES,
+					includeGitInstructions: false,
+				},
+				...(strictMcpConfig ? { extraArgs: { "strict-mcp-config": null } } : {}),
+				...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
+				...makeCliDebugOptions("usage-refresh"),
+			},
+		});
+
+		const aborted = new Promise<never>((_resolve, reject) => {
+			const onAbort = () => {
+				const reason = abortController.signal.reason;
+				reject(reason instanceof Error
+					? reason
+					: new Error(timedOut ? `Claude usage refresh timeout after ${timeoutMs}ms.` : "Claude usage refresh aborted."));
+			};
+			abortController.signal.addEventListener("abort", onAbort, { once: true });
+			removeAbortRejection = () => abortController.signal.removeEventListener("abort", onAbort);
+		});
+		const payload = await Promise.race([
+			sdkQuery.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET({ skipBehaviors: true }),
+			aborted,
+		]);
+		return snapshotFromClaudeUsage(payload);
+	} finally {
+		clearTimeout(timeout);
+		options.signal?.removeEventListener("abort", onCallerAbort);
+		removeAbortRejection?.();
+		try { sdkQuery?.close(); } catch {}
+	}
+}
 
 function updateUsage(output: AssistantMessage, usage: Record<string, number | undefined>, model: Model<any>): void {
 	if (usage.input_tokens != null) output.usage.input = usage.input_tokens;
@@ -1407,33 +1538,33 @@ async function consumeQuery(
 		if (message.type === "rate_limit_event") {
 			const info = (message as any).rate_limit_info;
 			debug("consumeQuery: rate_limit_event", JSON.stringify(info).slice(0, 300));
-			if (info?.status === "rejected") {
+			const snapshot = snapshotFromClaudeRateLimitInfo(info);
+			if (info?.status === "allowed") {
+				if (snapshot) publishProviderUsage({ version: 1, type: "snapshot", snapshot });
+				continue;
+			}
+			if (info?.status !== "allowed_warning" && info?.status !== "rejected") continue;
+
+			if (info.status === "rejected") {
 				// Held so the failure Claude Code sends next can be named as a rate limit.
 				queryCtx.rateLimitRejection = info;
-				// The "rate limited" notice below supersedes warnings; re-arm so the next
-				// window's warnings fire even if it opens straight into allowed_warning.
-				queryCtx.lastRateLimitWarnStep = null;
-				queryCtx.lastRateLimitWarnThreshold = undefined;
-				// resetsAt is Unix seconds, not milliseconds.
-				const resetsAt = info.resetsAt ? new Date(info.resetsAt * 1000).toLocaleTimeString() : "unknown";
-				piUI?.notify(`Claude rate limited (${info.rateLimitType ?? "unknown"}) — resets at ${resetsAt}`, "warning");
-			} else if (info?.status === "allowed") {
-				// Back under the threshold (window reset) — re-arm the warning dedupe.
-				queryCtx.lastRateLimitWarnStep = null;
-				queryCtx.lastRateLimitWarnThreshold = undefined;
-			} else if (info?.status === "allowed_warning") {
-				// utilization is a fraction (0..1); allowed_warning fires once it crosses surpassedThreshold.
-				const percent = Math.round((info.utilization ?? 0) * 100);
-				// The SDK emits one event per request, so only re-notify when the level
-				// rises past a new 5% step or the threshold changes.
-				const step = Math.floor(percent / 5);
-				const rose = queryCtx.lastRateLimitWarnStep === null || step > queryCtx.lastRateLimitWarnStep;
-				if (rose || info.surpassedThreshold !== queryCtx.lastRateLimitWarnThreshold) {
-					queryCtx.lastRateLimitWarnStep = step;
-					queryCtx.lastRateLimitWarnThreshold = info.surpassedThreshold;
-					piUI?.notify(`Claude rate limit warning: ${percent}% used (${info.rateLimitType ?? ""})`, "warning");
-				}
 			}
+			const percent = Math.round((info.utilization ?? 0) * 100);
+			// resetsAt is Unix seconds, not milliseconds.
+			const resetsAt = info.resetsAt ? new Date(info.resetsAt * 1000).toLocaleTimeString() : "unknown";
+			const event: Exclude<ProviderUsageEventV1, { type: "snapshot" }> = {
+				version: 1,
+				type: info.status === "rejected" ? "hard-limit" : "soft-warning",
+				provider: "anthropic",
+				message:
+					info.status === "rejected"
+						? `Claude rate limited (${info.rateLimitType ?? "unknown"}) — resets at ${resetsAt}`
+						: `Claude rate limit warning: ${percent}% used (${info.rateLimitType ?? "unknown"})`,
+				...(snapshot ? { snapshot } : {}),
+			};
+			const listeners = publishProviderUsage(event);
+			if (listeners > 0) noteStandaloneWarningHandledByListener(event);
+			else if (standaloneWarningContext) notifyWithStandaloneSessionPolicy(event, standaloneWarningContext);
 			continue;
 		}
 		if (!queryCtx.currentPiStream || !queryCtx.turnOutput) continue;
@@ -2203,6 +2334,14 @@ export default function (pi: ExtensionAPI) {
 	};
 	const registeredModels = applyLongContext(MODELS, longContextSettings);
 
+	let ownsUsageAdapter = false;
+	const ensureUsageAdapter = () => {
+		if (unregisterClaudeUsageAdapter) return;
+		unregisterClaudeUsageAdapter = registerClaudeUsageAdapter(refreshClaudeUsage);
+		ownsUsageAdapter = true;
+	};
+	ensureUsageAdapter();
+
 	if (!config.startupNoticeShown) {
 		if (config.provider?.plan === undefined) pendingNotices.push('Are you using a Max plan? You need to set provider.plan to "max" to unlock 1M context in Opus.');
 		if (config.askClaude?.enabled === undefined) pendingNotices.push("The AskClaude tool is opt-in only. Set askClaude.enabled to use it.");
@@ -2222,15 +2361,26 @@ export default function (pi: ExtensionAPI) {
 			g[ACTIVE_STREAM_SIMPLE_KEY] = undefined;
 		}
 	};
+	let ownsStandaloneWarningSession = false;
 	pi.on("session_start", (event, ctx) => {
 		piUI = ctx.ui;
 		piMode = ctx.mode;
+		// A later startup belongs to an in-process child. Warning UI and markers
+		// remain owned by the first/top-level session so reentrant provider calls
+		// share one durable allowance.
+		const isTopLevelSessionStart = event.reason !== "startup" || piSessionId === undefined;
+		if (isTopLevelSessionStart) {
+			ensureUsageAdapter();
+			beginStandaloneWarningSession(pi, ctx, event.reason === "fork");
+			ownsStandaloneWarningSession = true;
+		}
 		// Capture the top-level session only (see piSessionId above): "new",
 		// "resume" and "fork" each mint a new top-level id, while "startup" is
 		// captured only when nothing is held yet — the process's first startup.
 		// A later "startup" is an in-process child session and must not overwrite.
 		if (event.reason === "new" || event.reason === "resume" || event.reason === "fork" || piSessionId === undefined) {
-			piSessionId = ctx.sessionManager.getSessionId();
+			const sessionId = ctx.sessionManager?.getSessionId?.();
+			if (sessionId) piSessionId = sessionId;
 		}
 		if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") {
 			clearSession(`session_start:${event.reason}`);
@@ -2291,6 +2441,15 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", () => {
 		reportLeaks("session_shutdown");
 		clearSession("session_shutdown");
+		if (ownsStandaloneWarningSession) {
+			standaloneWarningContext = null;
+			ownsStandaloneWarningSession = false;
+		}
+		if (ownsUsageAdapter) {
+			unregisterClaudeUsageAdapter?.();
+			unregisterClaudeUsageAdapter = undefined;
+			ownsUsageAdapter = false;
+		}
 		// Not in clearSession: that also runs on session_start, and a live session
 		// still needs to be able to serve side requests.
 		if (registeredApiProvider) {

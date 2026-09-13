@@ -13,9 +13,11 @@
 
 console.log("=== session-resume-test.mjs ===");
 
+import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createRpcHarness, requireEnv } from "./lib/rpc-harness.mjs";
 
 const OTHER_PROVIDER = requireEnv("CLAUDE_BRIDGE_TESTING_ALT_PROVIDER");
@@ -33,6 +35,100 @@ const TEST_CWD_PREFIX = join(tmpdir(), "pi-claude-bridge-session-resume-");
 const TEST_CWD = mkdtempSync(TEST_CWD_PREFIX);
 mkdirSync(join(TEST_CWD, ".pi"));
 writeFileSync(join(TEST_CWD, ".pi", "claude-bridge.json"), '{"askClaude":{"enabled":true}}\n');
+
+// Run warning policy in isolated processes so the durable marker is the only
+// state shared by "resume" and "fork". Each query below feeds real SDK message
+// shapes through consumeQuery; no Claude completion is made.
+const BRIDGE_ROOT = fileURLToPath(new URL("..", import.meta.url));
+const WARNING_CHILD = String.raw`
+	import { pathToFileURL } from "node:url";
+	const root = process.env.BRIDGE_ROOT;
+	const { __test } = await import(pathToFileURL(root + "/src/index.ts").href);
+	const { QueryContext } = await import(pathToFileURL(root + "/src/query-state.ts").href);
+	delete globalThis[Symbol.for("pi.provider-usage.bus.v1")];
+	const restoredEntries = JSON.parse(process.env.WARNING_ENTRIES || "[]");
+	const markers = [];
+	const notifications = [];
+	__test.beginStandaloneWarningSession(
+		{ appendEntry(customType, data) { markers.push({ customType, data }); } },
+		{
+			sessionManager: { getEntries: () => restoredEntries },
+			ui: { notify(message) { notifications.push(message); } },
+		},
+		process.env.WARNING_MODE === "fork",
+	);
+	const model = { api: "claude-bridge", provider: "claude-bridge", id: "claude-fable-5-1" };
+	async function consume(messages) {
+		const context = new QueryContext();
+		context.currentPiStream = { push() {}, end() {} };
+		context.resetTurnState(model);
+		async function* stream() { for (const message of messages) yield message; }
+		await __test.consumeQuery(stream(), new Map(), model, () => false, context);
+		return context.turnOutput?.errorMessage;
+	}
+	const soft = (utilization) => ({
+		type: "rate_limit_event",
+		rate_limit_info: { status: "allowed_warning", utilization, resetsAt: 1_800_000_000, rateLimitType: "five_hour" },
+	});
+	const hard = {
+		type: "rate_limit_event",
+		rate_limit_info: { status: "rejected", utilization: 1, resetsAt: 1_800_000_000, rateLimitType: "five_hour" },
+	};
+	const failedResult = { type: "result", subtype: "success", is_error: true, result: "out of usage" };
+	const failures = [];
+	if (process.env.WARNING_MODE === "initial") {
+		await consume([soft(0.51)]); // top-level
+		await consume([soft(0.62)]); // reentrant
+		await consume([soft(0.78)]); // simulated subagent
+		failures.push(await consume([hard, failedResult]));
+		failures.push(await consume([hard, failedResult]));
+	} else {
+		await consume([soft(0.83)]);
+	}
+	process.stdout.write(JSON.stringify({ markers, notifications, failures }));
+`;
+
+function warningChild(mode, entries = []) {
+	const result = spawnSync(
+		process.execPath,
+		["--import", "tsx", "--input-type=module", "--eval", WARNING_CHILD],
+		{
+			cwd: BRIDGE_ROOT,
+			encoding: "utf8",
+			env: {
+				...process.env,
+				BRIDGE_ROOT,
+				WARNING_MODE: mode,
+				WARNING_ENTRIES: JSON.stringify(entries),
+				CLAUDE_BRIDGE_DEBUG_PATH: join(TEST_CWD, `warning-${mode}.log`),
+			},
+		},
+	);
+	if (result.status !== 0) {
+		throw new Error(`warning child ${mode} failed (${result.status}): ${result.stderr || result.stdout}`);
+	}
+	return JSON.parse(result.stdout);
+}
+
+console.log("Provider warning lifecycle: top-level/reentrant/subagent + resume/fork...");
+const initialWarnings = warningChild("initial");
+if (initialWarnings.markers.length !== 1) throw new Error(`expected one warning marker, got ${initialWarnings.markers.length}`);
+if (initialWarnings.notifications.length !== 3) {
+	throw new Error(`expected one soft and two hard notifications, got ${initialWarnings.notifications.length}`);
+}
+if (initialWarnings.failures.length !== 2 || initialWarnings.failures.some((failure) => !/Claude rate limit.*out of usage/.test(failure))) {
+	throw new Error(`expected both hard-limit failures to remain visible: ${JSON.stringify(initialWarnings.failures)}`);
+}
+const durableEntries = initialWarnings.markers.map((marker) => ({ type: "custom", ...marker }));
+const resumedWarnings = warningChild("resume", durableEntries);
+if (resumedWarnings.notifications.length !== 0 || resumedWarnings.markers.length !== 0) {
+	throw new Error(`resumed session repeated its warning: ${JSON.stringify(resumedWarnings)}`);
+}
+const forkedWarnings = warningChild("fork", durableEntries);
+if (forkedWarnings.notifications.length !== 1 || forkedWarnings.markers.length !== 1) {
+	throw new Error(`fork did not receive a fresh warning allowance: ${JSON.stringify(forkedWarnings)}`);
+}
+console.log("  warning lifecycle PASS");
 
 // Use harness but with custom args - start on non-provider model
 const harness = createRpcHarness({
