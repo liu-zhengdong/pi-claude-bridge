@@ -308,6 +308,27 @@ const SNAPSHOT_BASE = {
 	adapterId: "schuettc.pi-claude-bridge",
 } as const;
 
+/**
+ * Rate-limit types that describe the usage-credits ("overage") bucket. This bucket is only
+ * meaningful on usage-based accounts (credits enabled, or real spend). A subscription account
+ * with credits off still emits an "overage" rate-limit event at a phantom utilization, so it
+ * must be suppressed rather than shown.
+ */
+const OVERAGE_RATE_LIMIT_TYPES = new Set(["overage", "extra_usage"]);
+
+/**
+ * Whether the most recent complete snapshot showed the credits/overage bucket as active
+ * (credits enabled, or real credits spent). Partial rate-limit events carry no is_enabled or
+ * used_credits, so they defer to this to decide whether an "overage" window is real. Defaults
+ * to false: overage stays hidden until a complete snapshot confirms the bucket is active.
+ */
+let lastOverageActive = false;
+
+/** Reset the remembered overage activity. Test-only. */
+export function __resetOverageActivityForTest(): void {
+	lastOverageActive = false;
+}
+
 /** Normalize the rate-limit section returned by the Agent SDK's usage control. */
 export function snapshotFromClaudeUsage(payload: unknown, capturedAt = Date.now()): ProviderUsageSnapshotV1 {
 	if (!isRecord(payload) || !isRecord(payload.rate_limits)) {
@@ -349,7 +370,12 @@ export function snapshotFromClaudeUsage(payload: unknown, capturedAt = Date.now(
 		const monthlyLimit = finiteNumber(extra.monthly_limit);
 		const currency = typeof extra.currency === "string" && extra.currency.trim() ? extra.currency : undefined;
 		const enabled = typeof extra.is_enabled === "boolean" ? extra.is_enabled : undefined;
-		if (utilization !== undefined || usedCredits !== undefined || monthlyLimit !== undefined || currency || enabled !== undefined) {
+		// Only surface overage on usage-based accounts: credits explicitly enabled, or real spend
+		// recorded. A subscription account with credits off reports is_enabled=false and zero spend,
+		// so the window is dropped instead of showing a phantom utilization.
+		const overageActive = enabled === true || (usedCredits !== undefined && usedCredits > 0);
+		lastOverageActive = overageActive;
+		if (overageActive) {
 			windows.push({
 				id: "extra_usage",
 				label: "overage",
@@ -370,7 +396,11 @@ export function snapshotFromClaudeUsage(payload: unknown, capturedAt = Date.now(
 export function snapshotFromClaudeRateLimitInfo(info: unknown, capturedAt = Date.now()): ProviderUsageSnapshotV1 | undefined {
 	if (!isRecord(info) || typeof info.rateLimitType !== "string" || info.rateLimitType.trim() === "") return undefined;
 	const type = info.rateLimitType;
-	const metadata = ACCOUNT_WINDOWS[type] ?? { label: type.replaceAll("_", " ") };
+	// Credits/overage events are only real on usage-based accounts; suppress them unless a complete
+	// snapshot has confirmed the bucket is active (see lastOverageActive).
+	const isOverage = OVERAGE_RATE_LIMIT_TYPES.has(type);
+	if (isOverage && !lastOverageActive) return undefined;
+	const metadata = ACCOUNT_WINDOWS[type] ?? { label: isOverage ? "overage" : type.replaceAll("_", " ") };
 	const utilization = finiteNumber(info.utilization);
 	const resetsAt = finiteNumber(info.resetsAt);
 	const state =
@@ -389,7 +419,7 @@ export function snapshotFromClaudeRateLimitInfo(info: unknown, capturedAt = Date
 		...(resetsAt === undefined ? {} : { resetsAt }),
 		...(metadata.windowMinutes === undefined ? {} : { windowMinutes: metadata.windowMinutes }),
 		...(state === undefined ? {} : { state }),
-		scope: metadata.scope ?? { kind: "account" },
+		scope: isOverage ? { kind: "overage" } : metadata.scope ?? { kind: "account" },
 	};
 	return {
 		...SNAPSHOT_BASE,

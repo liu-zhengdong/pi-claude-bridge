@@ -144,6 +144,84 @@ describe("Claude provider usage protocol", () => {
 		});
 	});
 
+	it("suppresses overage on a subscription account with credits off", () => {
+		usageBus.__resetOverageActivityForTest();
+		const snapshot = usageBus.snapshotFromClaudeUsage({
+			...ACCOUNT_USAGE,
+			rate_limits: {
+				...ACCOUNT_USAGE.rate_limits,
+				extra_usage: { is_enabled: false, used_credits: 0, monthly_limit: 0, utilization: 90, currency: "USD" },
+			},
+		}, Date.parse("2026-09-13T01:00:00.000Z"));
+		assert.equal(snapshot.windows.find((window) => window.scope.kind === "overage"), undefined);
+	});
+
+	it("shows overage from real spend even when is_enabled is absent", () => {
+		usageBus.__resetOverageActivityForTest();
+		const snapshot = usageBus.snapshotFromClaudeUsage({
+			...ACCOUNT_USAGE,
+			rate_limits: {
+				...ACCOUNT_USAGE.rate_limits,
+				extra_usage: { used_credits: 4_500, monthly_limit: 5_000, utilization: 90, currency: "USD" },
+			},
+		}, Date.parse("2026-09-13T01:00:00.000Z"));
+		const overage = snapshot.windows.find((window) => window.scope.kind === "overage");
+		assert.ok(overage);
+		assert.equal(overage.usedPercent, 90);
+		assert.equal(overage.usedAmount, 45);
+	});
+
+	it("defaults to hiding a partial overage event before any complete snapshot", () => {
+		usageBus.__resetOverageActivityForTest();
+		assert.equal(
+			usageBus.snapshotFromClaudeRateLimitInfo({ status: "allowed_warning", rateLimitType: "overage", utilization: 0.9 }),
+			undefined,
+		);
+	});
+
+	it("drops a partial overage event when a complete snapshot reports credits off", () => {
+		usageBus.__resetOverageActivityForTest();
+		usageBus.snapshotFromClaudeUsage({
+			...ACCOUNT_USAGE,
+			rate_limits: { ...ACCOUNT_USAGE.rate_limits, extra_usage: { is_enabled: false, used_credits: 0 } },
+		});
+		const snapshot = usageBus.snapshotFromClaudeRateLimitInfo({
+			status: "allowed_warning",
+			rateLimitType: "overage",
+			utilization: 0.9,
+			resetsAt: 1_790_812_800,
+		});
+		assert.equal(snapshot, undefined);
+	});
+
+	it("surfaces a partial overage event once a complete snapshot confirms credits are active", () => {
+		usageBus.__resetOverageActivityForTest();
+		usageBus.snapshotFromClaudeUsage({
+			...ACCOUNT_USAGE,
+			rate_limits: {
+				...ACCOUNT_USAGE.rate_limits,
+				extra_usage: { is_enabled: true, used_credits: 800, monthly_limit: 10_000, utilization: 8, currency: "USD" },
+			},
+		});
+		const snapshot = usageBus.snapshotFromClaudeRateLimitInfo({
+			status: "allowed_warning",
+			rateLimitType: "overage",
+			utilization: 0.9,
+			resetsAt: 1_790_812_800,
+		});
+		assert.ok(snapshot);
+		assert.equal(snapshot.complete, false);
+		assert.deepEqual(snapshot.windows[0], {
+			id: "overage",
+			label: "overage",
+			usedPercent: 90,
+			resetsAt: 1_790_812_800,
+			state: "warning",
+			scope: { kind: "overage" },
+		});
+		usageBus.__resetOverageActivityForTest();
+	});
+
 	it("partial passive snapshots carry adapter identity and only supplied fields", () => {
 		const withoutUtilization = usageBus.snapshotFromClaudeRateLimitInfo({
 			status: "allowed_warning",
