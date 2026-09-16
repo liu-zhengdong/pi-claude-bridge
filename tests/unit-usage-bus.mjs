@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 
 const BUS_SYMBOL = Symbol.for("pi.provider-usage.bus.v1");
@@ -60,6 +63,15 @@ function activateHarness() {
 		appendEntry() {},
 	});
 	return handlers;
+}
+
+function sessionContext(cwd, sessionId) {
+	return {
+		cwd,
+		mode: "rpc",
+		sessionManager: { getSessionId: () => sessionId, getEntries: () => [] },
+		ui: { notify() {} },
+	};
 }
 
 describe("Claude provider usage protocol", () => {
@@ -235,6 +247,67 @@ describe("Claude provider usage protocol", () => {
 		});
 	});
 
+	it("builds a complete snapshot from unifiedWindows (5h + 7d) with no overage when isUsingOverage is false", () => {
+		const snapshot = usageBus.snapshotFromClaudeRateLimitInfo({
+			status: "allowed",
+			rateLimitType: "five_hour",
+			overageStatus: "rejected",
+			overageDisabledReason: "org_level_disabled",
+			isUsingOverage: false,
+			unifiedWindows: {
+				five_hour: { utilization: 0.47, resetsAt: 1_789_584_000 },
+				seven_day: { utilization: 0.11, resetsAt: 1_790_118_000 },
+			},
+		});
+		assert.ok(snapshot);
+		assert.equal(snapshot.complete, true);
+		assert.equal(snapshot.source, "claude-code-sdk-rate-limit-event");
+		assert.equal(snapshot.adapterId, "schuettc.pi-claude-bridge");
+		// No overage window when isUsingOverage is false.
+		assert.equal(snapshot.windows.find((window) => window.scope.kind === "overage"), undefined);
+		const fiveHour = snapshot.windows.find((window) => window.id === "five_hour");
+		const sevenDay = snapshot.windows.find((window) => window.id === "seven_day");
+		assert.deepEqual(fiveHour, {
+			id: "five_hour",
+			label: "5h",
+			usedPercent: 47,
+			resetsAt: 1_789_584_000,
+			windowMinutes: 300,
+			state: "available",
+			scope: { kind: "account" },
+		});
+		assert.deepEqual(sevenDay, {
+			id: "seven_day",
+			label: "7d",
+			usedPercent: 11,
+			resetsAt: 1_790_118_000,
+			windowMinutes: 10_080,
+			state: "available",
+			scope: { kind: "account" },
+		});
+	});
+
+	it("falls back to the legacy single-window partial snapshot when unifiedWindows is absent", () => {
+		const snapshot = usageBus.snapshotFromClaudeRateLimitInfo({
+			status: "allowed",
+			rateLimitType: "five_hour",
+			utilization: 0.42,
+			resetsAt: 1_800_000_000,
+		});
+		assert.ok(snapshot);
+		assert.equal(snapshot.complete, false);
+		assert.equal(snapshot.windows.length, 1);
+		assert.deepEqual(snapshot.windows[0], {
+			id: "five_hour",
+			label: "5h",
+			usedPercent: 42,
+			resetsAt: 1_800_000_000,
+			windowMinutes: 300,
+			state: "available",
+			scope: { kind: "account" },
+		});
+	});
+
 	it("registers the structural adapter when the bridge creates the bus", () => {
 		clearBus();
 		const refresh = async () => usageBus.snapshotFromClaudeUsage(ACCOUNT_USAGE);
@@ -254,16 +327,125 @@ describe("Claude provider usage protocol", () => {
 		assert.deepEqual(bus.adapters(), []);
 	});
 
-	it("extension activation registers no usage adapter (meter feed disabled)", () => {
+	it("extension activation publishes its adapter and unregisters it on shutdown", () => {
 		clearBus();
 		const handlers = activateHarness();
 		const bus = globalThis[BUS_SYMBOL];
-		// The bridge no longer owns the usage meter: pi-usage's native Anthropic
-		// OAuth meter does. Activation must register NO usage adapter — and the
-		// bridge no longer even creates the bus just to register itself.
-		assert.deepEqual(bus?.adapters() ?? [], []);
+		assert.equal(bus.adapters().length, 1);
+		assert.equal(bus.adapters()[0].id, "schuettc.pi-claude-bridge");
 		handlers.get("session_shutdown")();
-		assert.deepEqual(bus?.adapters() ?? [], []);
+		assert.deepEqual(bus.adapters(), []);
+	});
+
+	it("waits for the owning session_start when pi-usage refreshes first", async () => {
+		clearBus();
+		const root = mkdtempSync(join(tmpdir(), "claude-bridge-usage-owner-"));
+		const agentDir = join(root, "agent");
+		const ownerCwd = join(root, "owner");
+		mkdirSync(join(ownerCwd, ".pi"), { recursive: true });
+		mkdirSync(agentDir, { recursive: true });
+		writeFileSync(join(ownerCwd, ".pi", "claude-bridge.json"), JSON.stringify({
+			provider: {
+				autoMemoryEnabled: true,
+				strictMcpConfig: false,
+				pathToClaudeCodeExecutable: "/owner/claude",
+			},
+		}));
+		const oldAgentDir = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		let queryInput;
+		let usageCalls = 0;
+		let handlers;
+		try {
+			__test.setUsageControlQuery((input) => {
+				queryInput = input;
+				return {
+					async usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET() {
+						usageCalls++;
+						return ACCOUNT_USAGE;
+					},
+					close() {},
+				};
+			});
+			handlers = activateHarness();
+			const adapter = globalThis[BUS_SYMBOL].adapters()[0];
+			await assert.rejects(adapter.refresh({ timeoutMs: 5 }), /timeout/i);
+			const caller = new AbortController();
+			const aborted = adapter.refresh({ timeoutMs: 1_000, signal: caller.signal });
+			caller.abort(new Error("caller stopped before start"));
+			await assert.rejects(aborted, /caller stopped before start/);
+
+			const refreshing = adapter.refresh({ timeoutMs: 1_000 });
+			await Promise.resolve();
+			assert.equal(usageCalls, 0, "refresh must wait until the owner is ready");
+
+			handlers.get("session_start")({ reason: "startup" }, sessionContext(ownerCwd, "owner-session"));
+			const snapshot = await refreshing;
+			assert.equal(snapshot.version, 1);
+			assert.equal(queryInput.options.cwd, ownerCwd);
+			assert.equal(queryInput.options.env.AGENT_SESSION_ID, "owner-session");
+			assert.equal(queryInput.options.settings.autoMemoryEnabled, true);
+			assert.equal(queryInput.options.pathToClaudeCodeExecutable, "/owner/claude");
+			assert.equal(queryInput.options.strictMcpConfig, false);
+			assert.equal("extraArgs" in queryInput.options, false);
+		} finally {
+			handlers?.get("session_shutdown")();
+			__test.setUsageControlQuery();
+			if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = oldAgentDir;
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps refresh bound to the owner after a child factory activates", async () => {
+		clearBus();
+		const root = mkdtempSync(join(tmpdir(), "claude-bridge-usage-child-"));
+		const agentDir = join(root, "agent");
+		const ownerCwd = join(root, "owner");
+		const childCwd = join(root, "child");
+		for (const cwd of [ownerCwd, childCwd]) mkdirSync(join(cwd, ".pi"), { recursive: true });
+		mkdirSync(agentDir, { recursive: true });
+		writeFileSync(join(ownerCwd, ".pi", "claude-bridge.json"), JSON.stringify({
+			provider: { strictMcpConfig: false, pathToClaudeCodeExecutable: "/owner/claude" },
+		}));
+		writeFileSync(join(childCwd, ".pi", "claude-bridge.json"), JSON.stringify({
+			provider: { strictMcpConfig: true, pathToClaudeCodeExecutable: "/child/claude" },
+		}));
+		const oldAgentDir = process.env.PI_CODING_AGENT_DIR;
+		const oldCwd = process.cwd();
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		let ownerHandlers;
+		try {
+			let queryInput;
+			__test.setUsageControlQuery((input) => {
+				queryInput = input;
+				return {
+					async usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET() { return ACCOUNT_USAGE; },
+					close() {},
+				};
+			});
+			process.chdir(ownerCwd);
+			ownerHandlers = activateHarness();
+			ownerHandlers.get("session_start")({ reason: "startup" }, sessionContext(ownerCwd, "owner-session"));
+
+			process.chdir(childCwd);
+			const childHandlers = activateHarness();
+			childHandlers.get("session_start")({ reason: "startup" }, sessionContext(childCwd, "child-session"));
+			assert.equal(globalThis[BUS_SYMBOL].adapters().length, 1);
+			await globalThis[BUS_SYMBOL].adapters()[0].refresh({ timeoutMs: 1_000 });
+
+			assert.equal(queryInput.options.cwd, ownerCwd);
+			assert.equal(queryInput.options.env.AGENT_SESSION_ID, "owner-session");
+			assert.equal(queryInput.options.pathToClaudeCodeExecutable, "/owner/claude");
+			assert.equal(queryInput.options.strictMcpConfig, false);
+		} finally {
+			ownerHandlers?.get("session_shutdown")();
+			__test.setUsageControlQuery();
+			process.chdir(oldCwd);
+			if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = oldAgentDir;
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	it("registers into a compatible bus that existed before the bridge import", async () => {
@@ -430,41 +612,36 @@ describe("Claude provider usage protocol", () => {
 		assert.equal(events[0].message.includes("0%"), false);
 	});
 
-	it("maps SDK warning/rejected statuses to soft-warning and hard-limit events (no snapshot feed)", async () => {
+	it("maps SDK statuses directly to complete snapshot, soft-warning, and hard-limit events", async () => {
 		clearBus();
 		const events = [];
-		const unsubscribe = usageBus.getUsageBusV1().subscribe((event) => events.push(event));
+		const unregister = usageBus.registerClaudeUsageAdapter(async () => usageBus.snapshotFromClaudeUsage(ACCOUNT_USAGE));
+		const unsubscribe = globalThis[BUS_SYMBOL].subscribe((event) => events.push(event));
+		const unified = { five_hour: { utilization: 0.73, resetsAt: 1_789_584_000 }, seven_day: { utilization: 0.11, resetsAt: 1_790_118_000 } };
 		try {
 			await consume([
-				{ type: "rate_limit_event", rate_limit_info: { status: "allowed_warning", utilization: 0.73, resetsAt: 1_800_000_000, rateLimitType: "five_hour" } },
-				{ type: "rate_limit_event", rate_limit_info: { status: "allowed", utilization: 0.12, resetsAt: 1_800_001_000, rateLimitType: "five_hour" } },
+				{ type: "rate_limit_event", rate_limit_info: { status: "allowed_warning", isUsingOverage: false, utilization: 0.73, rateLimitType: "five_hour", unifiedWindows: unified } },
+				{ type: "rate_limit_event", rate_limit_info: { status: "allowed", isUsingOverage: false, rateLimitType: "five_hour", unifiedWindows: { five_hour: { utilization: 0.12, resetsAt: 1_789_584_000 }, seven_day: { utilization: 0.05, resetsAt: 1_790_118_000 } } } },
 				{ type: "rate_limit_event", rate_limit_info: { status: "rejected", utilization: 1, resetsAt: 1_800_002_000, rateLimitType: "five_hour" } },
 			]);
 		} finally {
 			unsubscribe();
+			unregister();
 		}
 
-		// The `allowed` status publishes nothing (meter feed disabled), and the
-		// warning/hard-limit events no longer carry a snapshot.
-		assert.deepEqual(events.map((event) => event.type), ["soft-warning", "hard-limit"]);
+		assert.deepEqual(events.map((event) => event.type), ["soft-warning", "snapshot", "hard-limit"]);
 		assert.match(events[0].message, /73% used/);
-		assert.equal("snapshot" in events[0], false);
-		assert.match(events[1].message, /rate limited \(five_hour\)/);
-		assert.equal("snapshot" in events[1], false);
-	});
-
-	it("publishes nothing for an allowed rate_limit_event (meter feed disabled)", async () => {
-		clearBus();
-		const events = [];
-		const unsubscribe = usageBus.getUsageBusV1().subscribe((event) => events.push(event));
-		try {
-			await consume([
-				{ type: "rate_limit_event", rate_limit_info: { status: "allowed", utilization: 0.42, resetsAt: 1_800_000_000, rateLimitType: "five_hour" } },
-			]);
-		} finally {
-			unsubscribe();
-		}
-		assert.equal(events.length, 0);
+		// The soft-warning carries a complete snapshot built from unifiedWindows (5h + 7d).
+		assert.equal(events[0].snapshot.complete, true);
+		assert.deepEqual(events[0].snapshot.windows.map((window) => window.id), ["five_hour", "seven_day"]);
+		assert.equal(events[0].snapshot.windows.find((window) => window.id === "five_hour").usedPercent, 73);
+		assert.equal(events[0].snapshot.windows.find((window) => window.id === "seven_day").usedPercent, 11);
+		// The allowed status publishes a complete snapshot from unifiedWindows.
+		assert.equal(events[1].snapshot.complete, true);
+		assert.deepEqual(events[1].snapshot.windows.map((window) => window.id), ["five_hour", "seven_day"]);
+		assert.equal(events[1].snapshot.windows.find((window) => window.id === "five_hour").usedPercent, 12);
+		assert.match(events[2].message, /rate limited \(five_hour\)/);
+		assert.equal(events[2].snapshot.windows[0].usedPercent, 100);
 	});
 });
 

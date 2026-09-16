@@ -392,17 +392,16 @@ export function snapshotFromClaudeUsage(payload: unknown, capturedAt = Date.now(
 	return { ...SNAPSHOT_BASE, source: "claude-code-sdk", capturedAt, complete: true, windows };
 }
 
-/** Build the partial snapshot carried by an SDK rate_limit_event. */
+/**
+ * Build the snapshot carried by an SDK rate_limit_event.
+ *
+ * Modern SDK payloads carry a COMPLETE usage picture in `info.unifiedWindows` (5h + 7d, each with
+ * `utilization` and epoch-seconds `resetsAt`). When present, build a complete snapshot from every
+ * known window. Older payloads that lack `unifiedWindows` fall back to the legacy single-window
+ * (partial) behavior driven by the top-level `rateLimitType`/`utilization`.
+ */
 export function snapshotFromClaudeRateLimitInfo(info: unknown, capturedAt = Date.now()): ProviderUsageSnapshotV1 | undefined {
-	if (!isRecord(info) || typeof info.rateLimitType !== "string" || info.rateLimitType.trim() === "") return undefined;
-	const type = info.rateLimitType;
-	// Credits/overage events are only real on usage-based accounts; suppress them unless a complete
-	// snapshot has confirmed the bucket is active (see lastOverageActive).
-	const isOverage = OVERAGE_RATE_LIMIT_TYPES.has(type);
-	if (isOverage && !lastOverageActive) return undefined;
-	const metadata = ACCOUNT_WINDOWS[type] ?? { label: isOverage ? "overage" : type.replaceAll("_", " ") };
-	const utilization = finiteNumber(info.utilization);
-	const resetsAt = finiteNumber(info.resetsAt);
+	if (!isRecord(info)) return undefined;
 	const state =
 		info.status === "allowed_warning"
 			? "warning"
@@ -411,6 +410,57 @@ export function snapshotFromClaudeRateLimitInfo(info: unknown, capturedAt = Date
 				: info.status === "allowed"
 					? "available"
 					: undefined;
+
+	if (isRecord(info.unifiedWindows)) {
+		const unifiedWindows = info.unifiedWindows;
+		const windows: NormalizedUsageWindow[] = [];
+		for (const [key, metadata] of Object.entries(ACCOUNT_WINDOWS)) {
+			const raw = unifiedWindows[key];
+			if (!isRecord(raw)) continue;
+			const utilization = finiteNumber(raw.utilization);
+			// unifiedWindows[key].resetsAt is already epoch SECONDS — use it directly.
+			const resetsAt = finiteNumber(raw.resetsAt);
+			if (utilization === undefined && resetsAt === undefined) continue;
+			windows.push({
+				id: key,
+				label: metadata.label,
+				...(utilization === undefined ? {} : { usedPercent: clampPercent(utilization * 100) }),
+				...(resetsAt === undefined ? {} : { resetsAt }),
+				...(metadata.windowMinutes === undefined ? {} : { windowMinutes: metadata.windowMinutes }),
+				...(state === undefined ? {} : { state }),
+				scope: metadata.scope ?? { kind: "account" },
+			});
+		}
+		// Overage is only real when the SDK confirms the account is actively using it. This is the
+		// correct, data-driven replacement for the lastOverageActive heuristic on the inline path.
+		if (info.isUsingOverage === true) {
+			windows.push({
+				id: "extra_usage",
+				label: "overage",
+				...(state === undefined ? {} : { state }),
+				scope: { kind: "overage" },
+			});
+		}
+		if (windows.length === 0) return undefined;
+		return {
+			...SNAPSHOT_BASE,
+			source: "claude-code-sdk-rate-limit-event",
+			capturedAt,
+			complete: true,
+			windows,
+		};
+	}
+
+	// Legacy fallback: older SDK payloads carry only a single top-level window.
+	if (typeof info.rateLimitType !== "string" || info.rateLimitType.trim() === "") return undefined;
+	const type = info.rateLimitType;
+	// Credits/overage events are only real on usage-based accounts; suppress them unless a complete
+	// snapshot has confirmed the bucket is active (see lastOverageActive).
+	const isOverage = OVERAGE_RATE_LIMIT_TYPES.has(type);
+	if (isOverage && !lastOverageActive) return undefined;
+	const metadata = ACCOUNT_WINDOWS[type] ?? { label: isOverage ? "overage" : type.replaceAll("_", " ") };
+	const utilization = finiteNumber(info.utilization);
+	const resetsAt = finiteNumber(info.resetsAt);
 	if (utilization === undefined && resetsAt === undefined && state === undefined) return undefined;
 	const window: NormalizedUsageWindow = {
 		id: type,
