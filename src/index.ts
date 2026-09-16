@@ -29,7 +29,6 @@ import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
 import {
 	publishProviderUsage,
 	registerClaudeUsageAdapter,
-	snapshotFromClaudeRateLimitInfo,
 	snapshotFromClaudeUsage,
 	type ProviderUsageAdapterV1,
 	type ProviderUsageEventV1,
@@ -1582,9 +1581,9 @@ async function consumeQuery(
 		if (message.type === "rate_limit_event") {
 			const info = (message as any).rate_limit_info;
 			debug("consumeQuery: rate_limit_event", JSON.stringify(info).slice(0, 300));
-			const snapshot = snapshotFromClaudeRateLimitInfo(info);
 			if (info?.status === "allowed") {
-				if (snapshot) publishProviderUsage({ version: 1, type: "snapshot", snapshot });
+				// The meter feed is disabled: pi-usage's native Anthropic OAuth meter
+				// owns the usage cache. Do NOT publish snapshots here.
 				continue;
 			}
 			if (info?.status !== "allowed_warning" && info?.status !== "rejected") continue;
@@ -1609,7 +1608,6 @@ async function consumeQuery(
 						: utilization === undefined
 							? `Claude rate limit warning (${rateLimitType})`
 							: `Claude rate limit warning: ${utilization}% used (${rateLimitType})`,
-				...(snapshot ? { snapshot } : {}),
 			};
 			const listeners = publishProviderUsage(event);
 			if (listeners === 0 && standaloneWarningContext) notifyWithStandaloneSessionPolicy(event, standaloneWarningContext);
@@ -2385,6 +2383,12 @@ export default function (pi: ExtensionAPI) {
 	let ownsUsageAdapter = false;
 	let ownedUsageAdapterOwner: ClaudeUsageAdapterOwner | undefined;
 	const ensureUsageAdapter = () => {
+		// Usage meter feed disabled: pi-usage's native Anthropic OAuth meter owns
+		// the usage cache, so the bridge no longer registers a usage adapter.
+		// Leaving `unregisterClaudeUsageAdapter` undefined and `ownsUsageAdapter`
+		// false makes the bind/shutdown guards below harmless no-ops.
+		return;
+		// eslint-disable-next-line no-unreachable
 		if (unregisterClaudeUsageAdapter) return;
 		const owner = createClaudeUsageAdapterOwner();
 		unregisterClaudeUsageAdapter = registerClaudeUsageAdapter(
