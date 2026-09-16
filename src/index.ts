@@ -29,9 +29,11 @@ import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
 import {
 	publishProviderUsage,
 	registerClaudeUsageAdapter,
+	snapshotFromClaudeRateLimitInfo,
 	snapshotFromClaudeUsage,
 	type ProviderUsageAdapterV1,
 	type ProviderUsageEventV1,
+	type ProviderUsageSnapshotV1,
 } from "./usage-bus.js";
 import {
 	notifyWithStandaloneSessionPolicy,
@@ -212,6 +214,11 @@ let registeredApiProvider = false;
 // extension instances share this module and must not replace or unregister the
 // top-level session's account-usage adapter.
 let unregisterClaudeUsageAdapter: (() => void) | undefined;
+
+// The most recent COMPLETE inline usage snapshot parsed from an SDK rate_limit_event's
+// `unifiedWindows`. The registered usage adapter prefers this over polling so the meter
+// reflects the freshest data the inference stream already delivered.
+let lastInlineUsageSnapshot: ProviderUsageSnapshotV1 | undefined;
 
 // Claude Code's own builtin tools, for the AskClaude path where CC really runs
 // them. The provider path never sees these — it starts CC with `tools: []`.
@@ -1581,9 +1588,10 @@ async function consumeQuery(
 		if (message.type === "rate_limit_event") {
 			const info = (message as any).rate_limit_info;
 			debug("consumeQuery: rate_limit_event", JSON.stringify(info).slice(0, 300));
+			const snapshot = snapshotFromClaudeRateLimitInfo(info);
+			if (snapshot?.complete) lastInlineUsageSnapshot = snapshot;
 			if (info?.status === "allowed") {
-				// The meter feed is disabled: pi-usage's native Anthropic OAuth meter
-				// owns the usage cache. Do NOT publish snapshots here.
+				if (snapshot) publishProviderUsage({ version: 1, type: "snapshot", snapshot });
 				continue;
 			}
 			if (info?.status !== "allowed_warning" && info?.status !== "rejected") continue;
@@ -1608,6 +1616,7 @@ async function consumeQuery(
 						: utilization === undefined
 							? `Claude rate limit warning (${rateLimitType})`
 							: `Claude rate limit warning: ${utilization}% used (${rateLimitType})`,
+				...(snapshot ? { snapshot } : {}),
 			};
 			const listeners = publishProviderUsage(event);
 			if (listeners === 0 && standaloneWarningContext) notifyWithStandaloneSessionPolicy(event, standaloneWarningContext);
@@ -2383,16 +2392,13 @@ export default function (pi: ExtensionAPI) {
 	let ownsUsageAdapter = false;
 	let ownedUsageAdapterOwner: ClaudeUsageAdapterOwner | undefined;
 	const ensureUsageAdapter = () => {
-		// Usage meter feed disabled: pi-usage's native Anthropic OAuth meter owns
-		// the usage cache, so the bridge no longer registers a usage adapter.
-		// Leaving `unregisterClaudeUsageAdapter` undefined and `ownsUsageAdapter`
-		// false makes the bind/shutdown guards below harmless no-ops.
-		return;
-		// eslint-disable-next-line no-unreachable
 		if (unregisterClaudeUsageAdapter) return;
 		const owner = createClaudeUsageAdapterOwner();
 		unregisterClaudeUsageAdapter = registerClaudeUsageAdapter(
-			(options) => refreshClaudeUsage(options, undefined, owner),
+			(options) =>
+				lastInlineUsageSnapshot !== undefined
+					? Promise.resolve(lastInlineUsageSnapshot)
+					: refreshClaudeUsage(options, undefined, owner),
 		);
 		ownedUsageAdapterOwner = owner;
 		ownsUsageAdapter = true;
