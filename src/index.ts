@@ -521,7 +521,26 @@ function describeRateLimitFailure(rejection: { rateLimitType?: string; resetsAt?
 	return `Claude rate limit${kind}${resets}: ${failure}`;
 }
 
+// pi 0.86.0 changed provider stream inputs from `Context` (carrying `systemPrompt`
+// and `tools` fields) to a normalized `TranscriptContext` whose prompt and tool
+// declarations are folded into a leading system message inside `messages`. This
+// bridge reads `context.systemPrompt` / `context.tools` and treats `messages` as
+// pure conversation, so reconstruct the old shape once at each provider entry.
+// It prefers explicit fields when present (a no-op on pre-0.86 inputs) and is
+// idempotent, so re-adapting an already-adapted context is harmless.
+function adaptContext(context: Context): Context {
+	const messages = context.messages ?? [];
+	const derivedSystemPrompt = typeof piAi.getCurrentSystemPrompt === "function" ? piAi.getCurrentSystemPrompt(messages) : undefined;
+	const derivedTools = typeof piAi.getCurrentTools === "function" ? piAi.getCurrentTools(messages) : undefined;
+	return {
+		systemPrompt: context.systemPrompt ?? (derivedSystemPrompt || undefined),
+		tools: context.tools ?? derivedTools,
+		messages: messages.filter((message) => message.role !== "system"),
+	};
+}
+
 function isolatedStreamFn(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
+	context = adaptContext(context);
 	const stream = newAssistantMessageEventStream();
 	void runIsolatedSummary(model, context, options, stream);
 	return stream;
@@ -1788,6 +1807,7 @@ function drainForAbort(c: QueryContext, promptStream: PromptStream): void {
  * lane fail on prompt-capture resolution.
  */
 function streamProviderEntry(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
+	context = adaptContext(context);
 	const lastRole = context.messages[context.messages.length - 1]?.role;
 	if (!!context.systemPrompt && context.messages.length === 1 && lastRole === "user") {
 		// Use the same discriminator the main lane lives by: a conversation turn's
@@ -1827,6 +1847,7 @@ function streamSideRequest(model: Model<any>, context: Context, options?: Simple
 }
 
 function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions, side = false): AssistantMessageEventStream {
+	context = adaptContext(context);
 	if (!side) showStartupNoticeOnce();
 	const stream = newAssistantMessageEventStream();
 
