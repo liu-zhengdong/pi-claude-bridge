@@ -40,6 +40,20 @@ pi install git:github.com/liu-zhengdong/pi-claude-bridge@<ref>
 - **不替换本地安装。** 合入后要更新本机，手动跑一次 `pi install`。
 - **不在 CI 里解决冲突。** PR 分支直接指向上游提交，差异和冲突由 PR 界面呈现。
 
+### 两个容易踩的坑
+
+都是实跑才暴露的，改动这个工作流时注意。
+
+**仓库开关。** 需要 Settings → Actions → General 里的「Allow GitHub Actions to create and approve pull requests」，默认是关的。只在 workflow 里声明 `pull-requests: write` 不够，建 PR 会报 `Resource not accessible by integration`。核对：
+
+```sh
+gh api repos/liu-zhengdong/pi-claude-bridge/actions/permissions/workflow \
+  --jq '.default_workflow_permissions, .can_approve_pull_request_reviews'
+# 期望：write / true
+```
+
+**`gh` 在 fork 里默认指向父仓库。** `gh pr create` 和 `gh issue create` 不写 `--repo` 的话会去操作 `schuettc/pi-claude-bridge`。工作流里已经显式传了 `--repo "${GITHUB_REPOSITORY}"`。
+
 合入一个同步 PR 之前：审阅差异确认 fork 自有改动没被覆盖 → 处理冲突 → 跑 `npm run test:unit` 和 `npm run typecheck`。
 
 上游那份工作流为什么不能留：它每天把 `schuettc-publish` rebase 到 `elidickinson/main` 并推送，然后发布 npm。在本 fork 上跑会重写我们自己的分支。

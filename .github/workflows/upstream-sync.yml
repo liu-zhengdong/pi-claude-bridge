@@ -65,6 +65,7 @@ jobs:
 
           behind="$(git rev-list --count "origin/${base}..${upstream_sha}")"
           gh pr create \
+            --repo "${GITHUB_REPOSITORY}" \
             --draft \
             --base "${base}" \
             --head "${branch}" \
