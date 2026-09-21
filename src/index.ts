@@ -1,17 +1,15 @@
 import { StringEnum, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions, type Tool } from "@earendil-works/pi-ai";
-import * as piAi from "@earendil-works/pi-ai";
 import { getApiProvider, registerApiProvider, unregisterApiProviders } from "@earendil-works/pi-ai/compat";
-import { buildSessionContext, compact, generateBranchSummary, keyHint, type BranchSummaryResult, type CompactionEntry, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { buildSessionContext, compact, generateBranchSummary, keyHint, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
-import { createSession, deleteSession, openSession, repairToolPairing } from "cc-session-io";
-import { appendFileSync, realpathSync, statSync } from "fs";
-import { PROVIDER_ID, convertPiMessages } from "./convert.js";
+import { deleteSession } from "cc-session-io";
+import { appendFileSync } from "fs";
+import { PROVIDER_ID } from "./convert.js";
 import { claudeCodeModelId } from "./models.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, renderSkillsBlock } from "./skills.js";
-import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
 import { QueryContext, ctx } from "./query-state.js";
 import { makePromptStream, userMessage, type PromptStream } from "./prompt-stream.js";
@@ -21,7 +19,6 @@ import {
 	projectPromptCapture,
 	PromptCaptures,
 } from "./prompt-capture.js";
-import { collectCarriedAttachments, placeCarriedAttachments, type CarriedAttachment } from "./attachments.js";
 import { createToolServer } from "./mcp-server.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
 import {
@@ -35,11 +32,11 @@ import {
 	restoreStandaloneWarningState,
 	type StandaloneWarningContext,
 } from "./usage-warning-state.js";
-import { DEBUG, DEBUG_LOG_PATH, RECORD_STREAM_PATH, debug, diagDump, makeCliDebugOptions, moduleInstanceId } from "./debug.js";
+import { RECORD_STREAM_PATH, debug, diagDump, makeCliDebugOptions, moduleInstanceId } from "./debug.js";
 import { describeRateLimitFailure, errorMessage, resultErrorText } from "./errors.js";
 import { mapStopReason, mapToolArgs, mapToolName, parsePartialJson, piToolNameFor } from "./mapping.js";
-import { advanceCursor, adoptSession, clearSharedSession, getDeliveredToolResultCursor, getSharedSession, markNeedsRebuild, orphanedToolResultAction, recordToolResultDelivery, setCursor, setSharedSession, type SessionState } from "./session-store.js";
-import { adaptContext, extractAllToolResults, extractIsolatedSummaryPrompt, extractUserPrompt, extractUserPromptBlocks, newAssistantOutput, steerBlocks, turnStart } from "./pi-context.js";
+import { adoptSession, clearSharedSession, getDeliveredToolResultCursor, getSharedSession, markNeedsRebuild, orphanedToolResultAction, recordToolResultDelivery, setCursor, setSharedSession, type SessionState } from "./session-store.js";
+import { adaptContext, extractAllToolResults, extractUserPrompt, extractUserPromptBlocks, steerBlocks, turnStart } from "./pi-context.js";
 import { CC_CHILD_ENV, CLAUDE_MD_EXCLUDES, REASONING_TO_EFFORT, childEnv } from "./cc-child.js";
 import {
 	bindUsageAdapter,
@@ -65,13 +62,9 @@ import {
 	setPiSessionId,
 	setPiUI,
 } from "./runtime-config.js";
-
-// Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
-const _piAi = piAi as any;
-const newAssistantMessageEventStream: () => AssistantMessageEventStream =
-	typeof _piAi.createAssistantMessageEventStream === "function"
-		? _piAi.createAssistantMessageEventStream
-		: () => new _piAi.AssistantMessageEventStream();
+import { buildSideRequestSession, syncSharedSession, type SyncResult } from "./session-sync.js";
+import { branchSummaryOutcome, isolatedStreamFn, reinjectPriorCompactionFileOps } from "./isolated-summary.js";
+import { newAssistantMessageEventStream } from "./pi-ai-compat.js";
 
 // --- Constants ---
 
@@ -124,407 +117,6 @@ const MODE_DISALLOWED_TOOLS: Record<string, string[]> = {
 		"WebFetch", "WebSearch",
 	],
 };
-
-// --- Session persistence ---
-
-/**
- * Claude Code's `@file` expansions from the session about to be replaced.
- *
- * Must be called before `deleteSession`, which wipes the file they live in —
- * reading after it yields nothing, with no error to notice.
- */
-function readCarriedAttachments(sessionId: string, cwd: string): CarriedAttachment[] {
-	try {
-		const previous = openSession({ sessionId, projectPath: cwd, claudeDir: process.env.CLAUDE_CONFIG_DIR });
-		return collectCarriedAttachments(previous.records);
-	} catch (error) {
-		// A post-abort rebuild reads a file the killed CC subprocess may have been
-		// midway through writing, and cc-session-io parses each line with a bare
-		// JSON.parse, so a truncated last line throws. Throwing here would turn a
-		// lost attachment into a failed turn; carrying none is exactly what happened
-		// before this existed, so the failure mode is bounded by the status quo.
-		debug(`WARNING: could not read attachments from session ${sessionId.slice(0, 8)}:`, error);
-		return [];
-	}
-}
-
-// Convert pi messages to Anthropic API format for session import.
-// Lossy: only text, thinking and toolCall blocks survive, and thinking only when
-// Claude Code itself minted the signature. An assistant message whose blocks all
-// filter out keeps its slot with a placeholder, since dropping it can create a
-// tool_result with no preceding tool_use. A turn aborted before anything streamed
-// is dropped instead — it never had content, and inventing one diverges from the
-// prefix Claude Code cached.
-function convertAndImportMessages(
-	session: ReturnType<typeof createSession>,
-	messages: Context["messages"],
-	customToolNameToSdk?: Map<string, string>,
-	carried?: readonly CarriedAttachment[],
-): void {
-	const { anthropicMessages, sanitizedIds, dropped } = convertPiMessages(messages, customToolNameToSdk);
-
-	debug(`convertAndImportMessages: ${messages.length} pi msgs → ${anthropicMessages.length} anthropic msgs`);
-	debug(`convertAndImportMessages: imported roles:`, anthropicMessages.map((m, i) => {
-		const c = m.content;
-		if (typeof c === "string") return `[${i}]${m.role}:text`;
-		if (Array.isArray(c)) return `[${i}]${m.role}:${(c).map((b) => b.type).join("+")}`;
-		return `[${i}]${m.role}:?`;
-	}).join(" "));
-	// The roles line above shows only what survived, so a stripped block is
-	// indistinguishable there from one that never existed. Name the losses.
-	const droppedParts = [
-		dropped.thinking ? `${dropped.thinking} thinking (${[...dropped.providers].sort().join(", ")})` : "",
-		dropped.abortedTurns ? `${dropped.abortedTurns} aborted turn(s)` : "",
-		...[...dropped.other].map(([type, n]) => `${n} ${type}`),
-	].filter(Boolean);
-	if (droppedParts.length > 0) {
-		debug(`convertAndImportMessages: dropped ${droppedParts.join(", ")}`);
-	}
-	if (sanitizedIds.size > 0) {
-		debug(`convertAndImportMessages: sanitized ${sanitizedIds.size} tool IDs:`,
-			[...sanitizedIds.entries()].map(([orig, clean]) => orig === clean ? orig : `${orig}→${clean}`).join(", "));
-	}
-	// Pre-repair for debug logging; importMessages also repairs internally (idempotent).
-	const repaired = repairToolPairing(anthropicMessages);
-	if (repaired.length !== anthropicMessages.length) {
-		debug(`convertAndImportMessages: repairToolPairing ${anthropicMessages.length} → ${repaired.length} msgs`);
-	}
-	// Placement runs against the repaired array because that is the index space
-	// importMessages reads. Attachments are links in CC's uuid chain, so they have
-	// to be written in order with the messages, not appended afterwards.
-	const placed = carried?.length
-		? placeCarriedAttachments(carried, repaired as unknown as { role: string; content: unknown }[])
-		: undefined;
-	if (placed?.skipped.length) {
-		debug(`convertAndImportMessages: dropped ${placed.skipped.length} carried attachment(s): ${placed.skipped.join("; ")}`);
-	}
-	if (placed?.attachments.length) {
-		debug(`convertAndImportMessages: carrying ${placed.attachments.length} attachment(s) across the rebuild`);
-	}
-	if (repaired.length) {
-		session.importMessages(repaired, placed?.attachments.length ? { attachments: placed.attachments } : undefined);
-	}
-}
-
-function isolatedStreamFn(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
-	context = adaptContext(context);
-	const stream = newAssistantMessageEventStream();
-	void runIsolatedSummary(model, context, options, stream);
-	return stream;
-}
-
-async function runIsolatedSummary(
-	model: Model<any>,
-	context: Context,
-	options: SimpleStreamOptions | undefined,
-	stream: AssistantMessageEventStream,
-): Promise<void> {
-	let sdkQuery: ReturnType<typeof query> | undefined;
-	let wasAborted = false;
-	const onAbort = () => {
-		wasAborted = true;
-		void sdkQuery?.interrupt().catch(() => {});
-		try { sdkQuery?.close(); } catch {}
-	};
-
-	try {
-		const promptText = extractIsolatedSummaryPrompt(context.messages);
-		const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
-		const compactProviderSettings = loadConfig(cwd).provider;
-		const claudeExecutable = compactProviderSettings?.pathToClaudeCodeExecutable;
-		const cliModel = claudeCodeModelId(model, getLongContextSettings());
-		debug(`compact summary: spawn model=${cliModel} registeredModel=${model.id} promptLen=${promptText.length}`);
-
-		sdkQuery = query({
-			prompt: promptText,
-			options: {
-				cwd,
-				env: childEnv(process.env, getPiSessionId()),
-				settings: { autoMemoryEnabled: false },
-				tools: [],
-				strictMcpConfig: true,
-				settingSources: [] as SettingSource[],
-				skills: [],
-				persistSession: false,
-				systemPrompt: context.systemPrompt,
-				model: cliModel,
-				maxTurns: 1,
-				...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
-				...makeCliDebugOptions("compact-summary"),
-			},
-		});
-
-		if (options?.signal) {
-			if (options.signal.aborted) onAbort();
-			else options.signal.addEventListener("abort", onAbort, { once: true });
-		}
-
-		let assistantText = "";
-		let finalText = "";
-		let errorText: string | undefined;
-		let firstEventLogged = false;
-
-		for await (const message of sdkQuery) {
-			if (!firstEventLogged) {
-				debug(`compact summary: first event type=${message.type}`);
-				firstEventLogged = true;
-			}
-			if (wasAborted) break;
-
-			if (message.type === "assistant") {
-				for (const block of (message as any).message?.content ?? []) {
-					if (block.type === "text" && typeof block.text === "string") assistantText += block.text;
-				}
-			} else if (message.type === "result") {
-				logServedContextWindow("compact summary", message, model);
-				errorText = resultErrorText(message);
-				if (!errorText && message.subtype === "success") finalText = message.result || assistantText;
-			}
-		}
-
-		if (wasAborted) {
-			const output = newAssistantOutput(model, "", "aborted", "Operation aborted");
-			debug("compact summary: aborted");
-			stream.push({ type: "error", reason: "aborted", error: output });
-			stream.end();
-			return;
-		}
-
-		const text = finalText || assistantText;
-		if (errorText || !text.trim()) {
-			const msg = errorText ?? "Claude Code summary returned empty text";
-			debug(`compact summary: error ${msg}`);
-			stream.push({ type: "error", reason: "error", error: newAssistantOutput(model, "", "error", msg) });
-			stream.end();
-			return;
-		}
-
-		debug(`compact summary: done textLen=${text.length}`);
-		stream.push({ type: "done", reason: "stop", message: newAssistantOutput(model, text, "stop") });
-		stream.end();
-	} catch (err) {
-		const msg = errorMessage(err);
-		debug("runIsolatedSummary threw; pushing terminal error", err);
-		stream.push({ type: "error", reason: "error", error: newAssistantOutput(model, "", "error", msg) });
-		stream.end();
-	} finally {
-		options?.signal?.removeEventListener("abort", onAbort);
-		try { sdkQuery?.close(); } catch {}
-	}
-}
-
-function reinjectPriorCompactionFileOps(branchEntries: Array<{ type: string; details?: unknown }>, preparation: { fileOps: { read: Set<string>; edited: Set<string> } }): void {
-	const prior = [...branchEntries]
-		.reverse()
-		.find((entry): entry is CompactionEntry => entry.type === "compaction");
-	const details = prior?.details as { readFiles?: unknown; modifiedFiles?: unknown } | undefined;
-	if (!Array.isArray(details?.readFiles) || !Array.isArray(details?.modifiedFiles)) return;
-	for (const file of details.readFiles) preparation.fileOps.read.add(String(file));
-	for (const file of details.modifiedFiles) preparation.fileOps.edited.add(String(file));
-	debug(`compact takeover: re-injected prior file ops read=${details.readFiles.length} modified=${details.modifiedFiles.length}`);
-}
-
-interface SyncResult {
-	sessionId: string | null;
-	preserveSharedSession?: boolean;
-}
-
-/**
- * Ensure the shared session has all messages up to (but not including) the last user message.
- * Returns session ID to resume from, or null if no resume needed.
- */
-// Read the session file we just wrote and sanity-check it. Warns instead of
-// throwing — CC may be more tolerant than our checks, so a false positive
-// shouldn't block the user. Pure logic is in session-verify.js; this wrapper
-// fans each warning out to debug log + piUI notify + diagDump.
-function verifyWrittenSession(
-	jsonlPath: string,
-	expectedSessionId: string,
-	expectedRecordCount: number,
-	cwd: string,
-): void {
-	const warnings = _verifyWrittenSession(jsonlPath, expectedSessionId, expectedRecordCount);
-	for (const msg of warnings) {
-		debug(`WARNING session verify: ${msg}`);
-		getPiUI()?.notify(
-			`Session file issue: ${msg}\n` +
-			`cwd=${cwd} realpath=${safeRealpath(cwd)} CLAUDE_CONFIG_DIR=${process.env.CLAUDE_CONFIG_DIR ?? "(unset)"}\n` +
-			`Please copy and paste this message into a new issue at https://github.com/elidickinson/pi-claude-bridge/issues/new` +
-			(DEBUG ? ` and attach ${DEBUG_LOG_PATH}` : ` (rerun with CLAUDE_BRIDGE_DEBUG=1 to capture a debug log)`),
-			"warning",
-		);
-		diagDump("session_verify_fail", { msg, jsonlPath, cwd, realpath: safeRealpath(cwd), claudeConfigDir: process.env.CLAUDE_CONFIG_DIR ?? null });
-	}
-}
-
-function safeRealpath(p: string): string {
-	try { return realpathSync(p); } catch (e) { return `<failed: ${(e as Error).message}>`; }
-}
-
-// Diagnostic snapshot of where a session file was just written. Catches the
-// class of bugs where pi writes to ~/.claude/projects/<X> but CC SDK reads
-// from ~/.claude/projects/<Y> (symlinks, CLAUDE_CONFIG_DIR, hash mismatch).
-function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void {
-	const realCwd = safeRealpath(cwd);
-	let fileSize: number | null = null;
-	let fileExists = false;
-	try {
-		const st = statSync(jsonlPath);
-		fileExists = true;
-		fileSize = st.size;
-	} catch { /* file may not exist yet */ }
-	debug(`${label}: cwd=${cwd}`);
-	if (realCwd !== cwd) debug(`${label}: realpath(cwd)=${realCwd} (DIFFERS — symlink-resolved path is what CC SDK uses)`);
-	debug(`${label}: jsonlPath=${jsonlPath}`);
-	debug(`${label}: fileExists=${fileExists}${fileSize != null ? ` size=${fileSize}` : ""}`);
-	debug(`${label}: env.CLAUDE_CONFIG_DIR=${process.env.CLAUDE_CONFIG_DIR ?? "(unset)"} HOME=${process.env.HOME ?? "(unset)"}`);
-}
-
-// Two semantic paths:
-//   REUSE — pi's history is in sync with the existing sharedSession (or drifted
-//     only by the trailing final-assistant message that pi appends after
-//     streamSimple returns, which CC's own persisted session already has).
-//     Returns the existing sessionId. Keeps CC's prompt cache warm.
-//   REBUILD — no session yet, or pi's history has diverged (non-trailing
-//     missed messages, e.g. another provider took a turn). Wipes the existing
-//     session file (if any) and writes a fresh one containing all prior
-//     messages, reusing the same sessionId across rebuilds so UUIDs stay
-//     stable for the lifetime of pi's session.
-//
-// Why a full rebuild rather than patching:
-//   Injecting deltas into an existing session creates a branch that CC's
-//   --resume doesn't follow (documented attempt prior to this). A complete
-//   overwrite at the same path is simpler and correct.
-//
-// Why reuse the sessionId across rebuilds:
-//   CC re-reads the JSONL on every --resume call — no in-process UUID
-//   caching. Validated in tests/exp-session-clear.mjs, including the case
-//   where CC had appended its own tool_use/tool_result records between
-//   rebuilds. Preserving the UUID means stable log correlation across
-//   provider switches and no orphaned session files.
-//
-// Log strings still say "Case 1/2/3/4" so existing diagnostics (int-cache.sh,
-// int-session-resume.mjs) keep grepping the same anchors.
-function syncSharedSession(
-	messages: Context["messages"],
-	cwd: string,
-	customToolNameToSdk?: Map<string, string>,
-	modelId?: string,
-): SyncResult {
-	const priorMessages = messages.slice(0, turnStart(messages)); // everything before the current user turn
-
-	// REUSE path
-	//
-	// Guard on priorMessages.length >= cursor: a shorter incoming context cannot
-	// be a continuation of the cached session. This is the general invariant for
-	// pi-side history rewrites such as /compact and session_tree: without it,
-	// missed = [].slice(cursor) can falsely hit REUSE and resume an unrelated
-	// longer CC session. See issue #25.
-	const existing = getSharedSession();
-	if (existing && !existing.needsRebuild && priorMessages.length >= existing.cursor) {
-		const missed = priorMessages.slice(existing.cursor);
-		const trailingAssistantOnly =
-			missed.length === 1 && (missed[0] as { role?: string }).role === "assistant";
-		if (missed.length === 0 || trailingAssistantOnly) {
-			if (trailingAssistantOnly) {
-				advanceCursor(priorMessages.length, cwd);
-			}
-			// Re-read: advanceCursor replaces the record, so `existing` is stale here.
-			const session = getSharedSession()!;
-			debug(`Case 3: ${trailingAssistantOnly ? "advanced cursor past trailing assistant, " : ""}resuming session ${session.sessionId.slice(0, 8)}, cursor=${session.cursor}`);
-			debug(`syncResult: path=reuse sessionId=${session.sessionId} cursor=${session.cursor}`);
-			return { sessionId: session.sessionId };
-		}
-	}
-	// This is what keeps a reentrant subagent from taking over the parent's
-	// session: a subagent starts with priors of its own, shorter than the parent's
-	// cursor, so it lands here, gets a fresh session, and the ephemeral session it
-	// captures is deleted once its query completes (see preserveSharedSession in
-	// the completion handler). Remove this branch and a subagent resumes — then
-	// overwrites — the parent's session. The non-isolated AskClaude path reaches it
-	// the same way.
-	//
-	// It is NOT, despite an earlier comment here, the isolated compact-summary
-	// path: runIsolatedSummary never calls syncSharedSession at all.
-	//
-	// Only reachable when needsRebuild is false — user-facing history rewrites
-	// (/compact, session_tree, /new, fork) always set needsRebuild or clear
-	// sharedSession before the next syncSharedSession call.
-	if (existing && !existing.needsRebuild && priorMessages.length < existing.cursor) {
-		debug(`Case 1 synthetic: clean start for shorter context, preserving shared session ${existing.sessionId.slice(0, 8)}, cursor=${existing.cursor}`);
-		debug(`syncResult: path=clean-start preserve-shared sessionId=${existing.sessionId} cursor=${existing.cursor}`);
-		return { sessionId: null, preserveSharedSession: true };
-	}
-
-	// REBUILD path
-	if (priorMessages.length === 0) {
-		debug(`Case 1: clean start, ${messages.length} total messages`);
-		debug(`syncResult: path=clean-start`);
-		return { sessionId: null };
-	}
-	const previousSessionId = existing?.sessionId;
-	const previousCursor = existing?.cursor ?? 0;
-	// preserveId: rebuild in place (deleteSession + createSession with the
-	// existing UUID), so prompt-cache UUIDs stay stable for log correlation
-	// and for any tools that key off them. Skipped only when there's a
-	// concurrent writer we shouldn't race — see forceRotate docs above.
-	const preserveId = previousSessionId !== undefined && !existing?.forceRotate;
-	// Before deleteSession — it wipes the file these live in.
-	const carried = previousSessionId !== undefined ? readCarriedAttachments(previousSessionId, cwd) : [];
-	if (preserveId) {
-		// Wipe prior jsonl + companion dir (no-op if nothing to wipe).
-		deleteSession(previousSessionId!, cwd, process.env.CLAUDE_CONFIG_DIR);
-	}
-	const session = createSession({
-		projectPath: cwd,
-		claudeDir: process.env.CLAUDE_CONFIG_DIR,
-		...(preserveId ? { sessionId: previousSessionId } : {}),
-		...(modelId ? { model: modelId } : {}),
-	});
-	convertAndImportMessages(session, priorMessages, customToolNameToSdk, carried);
-	session.save();
-	// records, not messages: `messages` filters out the attachment records that
-	// carrying an `@file` expansion across a rebuild writes into the same file.
-	verifyWrittenSession(session.jsonlPath, session.sessionId, session.records.length, cwd);
-	adoptSession(session.sessionId, priorMessages.length, cwd);
-	if (previousSessionId === undefined) {
-		debug(`Case 2: first turn with ${priorMessages.length} prior messages → session ${session.sessionId.slice(0, 8)}, ${session.records.length} records`);
-	} else if (preserveId) {
-		const missedCount = priorMessages.length - previousCursor;
-		debug(`Case 4: ${missedCount} missed messages, ${priorMessages.length} total → rewrote session ${session.sessionId.slice(0, 8)} (same id), ${session.records.length} records`);
-	} else {
-		debug(`Case 4 post-abort: ${priorMessages.length} total → new session ${session.sessionId.slice(0, 8)} (was ${previousSessionId.slice(0, 8)}, rotated to avoid race with orphan writer), ${session.records.length} records`);
-	}
-	debugSessionPaths(`${session.sessionId.slice(0, 8)}`, cwd, session.jsonlPath);
-	debug(`syncResult: path=rebuild sessionId=${session.sessionId} priors=${priorMessages.length} ${previousSessionId === undefined ? "first" : preserveId ? "preserved" : "rotated-post-abort"}`);
-	return { sessionId: session.sessionId };
-}
-
-/**
- * A throwaway Claude Code session holding a side request's own prior messages.
- *
- * Deliberately not `syncSharedSession`: that function is about keeping one
- * long-lived session aligned with pi's history, and every one of its paths reads
- * or writes `sharedSession`. A side request's history belongs to its caller, so it
- * gets a session of its own, rebuilt per call and deleted when the query ends.
- */
-function buildSideRequestSession(
-	priorMessages: Context["messages"],
-	cwd: string,
-	customToolNameToSdk?: Map<string, string>,
-	modelId?: string,
-): string {
-	const session = createSession({
-		projectPath: cwd,
-		claudeDir: process.env.CLAUDE_CONFIG_DIR,
-		...(modelId ? { model: modelId } : {}),
-	});
-	convertAndImportMessages(session, priorMessages, customToolNameToSdk, []);
-	session.save();
-	verifyWrittenSession(session.jsonlPath, session.sessionId, session.records.length, cwd);
-	debug(`side request: built session ${session.sessionId.slice(0, 8)} from ${priorMessages.length} prior messages, ${session.records.length} records`);
-	return session.sessionId;
-}
 
 // @internal
 export const __test = {
@@ -661,24 +253,6 @@ function reportLeaks(label: string): void {
 	);
 }
 
-/** What pi's branch summary means for the navigation it was asked for.
- *
- *  Cancelling on failure matches pi's own path, which rethrows a summary error out
- *  of the navigation rather than moving without one. Separated from the event
- *  handler so this decision is testable without a Claude Code subprocess — driving
- *  `generateBranchSummary` itself would only be testing pi. */
-function branchSummaryOutcome(result: BranchSummaryResult): { cancel: true } | { summary: { summary: string; details: unknown; usage?: BranchSummaryResult["usage"] } } {
-	if (result.aborted) return { cancel: true };
-	if (result.error) throw new Error(result.error);
-	debug(`session_before_tree: takeover complete summaryLen=${result.summary?.length ?? 0}`);
-	return {
-		summary: {
-			summary: result.summary ?? "",
-			details: { readFiles: result.readFiles ?? [], modifiedFiles: result.modifiedFiles ?? [] },
-			usage: result.usage,
-		},
-	};
-}
 
 function contextForToolResults(results: McpResult[]): QueryContext | undefined {
 	for (const result of results) {
