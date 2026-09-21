@@ -319,6 +319,32 @@ function readCarriedAttachments(sessionId: string, cwd: string): CarriedAttachme
 
 let sharedSession: SessionState | null = null;
 
+// Message count at which tool results were last handed to a live top-level query.
+//
+// Pi's auto-retry re-issues the *same* context after a provider error, so a tool
+// result we already delivered comes back with an identical message count. That is
+// a turn to resume, not a fresh orphan to end — see orphanedToolResultAction.
+let deliveredToolResultCursor = 0;
+
+/**
+ * What to do with a context whose last message is a tool result that no live
+ * query owns. Two different situations arrive in exactly the same shape:
+ *
+ *  - "end-turn": pi aborted a tool call and delivered the result anyway. The turn
+ *    is over, so emit an empty end_turn and wait for the next real user message.
+ *  - "resume": pi is retrying a turn whose query we killed (auto-retry after a
+ *    provider error, e.g. a stalled stream). The result was already delivered
+ *    once and the model still owes a response, so rebuild and continue.
+ *
+ * Message count tells them apart. A retry carries the exact context we last
+ * delivered results for; a fresh orphan has grown since then by at least the
+ * assistant tool call and its result. A zero cursor means we have delivered
+ * nothing yet, so it can never be a retry.
+ */
+function orphanedToolResultAction(messageCount: number, deliveredCursor: number): "end-turn" | "resume" {
+	return deliveredCursor > 0 && deliveredCursor === messageCount ? "resume" : "end-turn";
+}
+
 // Convert pi messages to Anthropic API format for session import.
 // Lossy: only text, thinking and toolCall blocks survive, and thinking only when
 // Claude Code itself minted the signature. An assistant message whose blocks all
@@ -870,6 +896,7 @@ export const __test = {
 	setPiUI(ui: ExtensionUIContext | null) {
 		piUI = ui;
 	},
+	orphanedToolResultAction,
 	syncSharedSession,
 	buildSideRequestSession,
 	extractUserPromptBlocks,
@@ -1883,15 +1910,25 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		// — observed pulling a parent from 5 back to 3, which cost the parent's next
 		// turn a full rebuild and a flushed prompt cache.
 		if (sharedSession && resultCtx === ctx()) sharedSession.cursor = context.messages.length;
+		// Same top-level-only reasoning as the cursor above: a subagent's message
+		// count must not decide what the parent's next call means.
+		if (resultCtx === ctx()) deliveredToolResultCursor = context.messages.length;
 		resultCtx.latestCursor = Math.max(resultCtx.latestCursor, context.messages.length);
 		return stream;
 	}
 
-	// --- Orphaned tool result (e.g. user aborted a tool call) ---
-	// The query is gone but pi still delivered the result. Nothing to do — just
-	// emit end_turn so pi waits for the next real user message.
+	// --- Tool result with no live query ---
+	// Either pi aborted a tool call and delivered the result anyway (end the turn),
+	// or pi is retrying a turn whose query we killed (resume it). See
+	// orphanedToolResultAction.
 	const lastMsg = context.messages[context.messages.length - 1];
-	if (lastMsg?.role === "toolResult") {
+	const orphanAction = lastMsg?.role === "toolResult"
+		? orphanedToolResultAction(context.messages.length, deliveredToolResultCursor)
+		: null;
+	if (orphanAction === "resume") {
+		debug(`provider: re-issued tool-result continuation (cursor=${deliveredToolResultCursor}), resuming as fresh query`);
+	}
+	if (orphanAction === "end-turn") {
 		debug(`provider: orphaned tool result after abort, emitting end_turn`);
 		if (sharedSession && activeQueryContexts.size === 0) sharedSession.cursor = context.messages.length;
 		// No query owns this result, so there is no context to reset: resetTurnState
@@ -1974,7 +2011,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// Guard: empty prompt means the last context message isn't a user message.
 	// This should never happen with per-query state — dump diagnostics if it does.
 	if (!promptText && !promptBlocks) {
-		diagDump("empty_prompt", {
+		// A resumed continuation has no user turn by construction, so it takes the
+		// same "[continue]" recovery below without being an anomaly worth dumping.
+		if (orphanAction !== "resume") diagDump("empty_prompt", {
 			contextLength: context.messages.length,
 			lastMsgRole: lastMsg?.role,
 			isReentrant,
