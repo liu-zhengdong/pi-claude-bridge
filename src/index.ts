@@ -1,14 +1,14 @@
-import { calculateCost, StringEnum, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type UserMessage } from "@earendil-works/pi-ai";
+import { calculateCost, StringEnum, type AssistantMessage, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions, type Tool } from "@earendil-works/pi-ai";
 import * as piAi from "@earendil-works/pi-ai";
 import { getApiProvider, getModels, registerApiProvider, unregisterApiProviders } from "@earendil-works/pi-ai/compat";
 import { buildSessionContext, compact, generateBranchSummary, keyHint, type BranchSummaryResult, type CompactionEntry, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
-import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
+import type { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 import { createSession, deleteSession, openSession, repairToolPairing } from "cc-session-io";
 import { appendFileSync, realpathSync, statSync } from "fs";
-import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
+import { PROVIDER_ID, convertPiMessages } from "./convert.js";
 import { applyLongContext, buildModels, claudeCodeModelId, type LongContextSettings, resolveModel as _resolveModel } from "./models.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, renderSkillsBlock } from "./skills.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
@@ -42,6 +42,7 @@ import {
 import { DEBUG, DEBUG_LOG_PATH, RECORD_STREAM_PATH, debug, diagDump, makeCliDebugOptions, moduleInstanceId } from "./debug.js";
 import { describeRateLimitFailure, errorMessage, resultErrorText } from "./errors.js";
 import { mapStopReason, mapToolArgs, mapToolName, parsePartialJson, piToolNameFor } from "./mapping.js";
+import { adaptContext, extractAllToolResults, extractIsolatedSummaryPrompt, extractUserPrompt, extractUserPromptBlocks, newAssistantOutput, steerBlocks, turnStart } from "./pi-context.js";
 
 // Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
 const _piAi = piAi as any;
@@ -313,139 +314,6 @@ function convertAndImportMessages(
 	if (repaired.length) {
 		session.importMessages(repaired, placed?.attachments.length ? { attachments: placed.attachments } : undefined);
 	}
-}
-
-// Pi doesn't pass tool results directly — it appends them to the context and calls
-// the provider again. Thin wrapper over extract-tool-results.js that adds per-turn
-// debug logging at the extraction boundary.
-function extractAllToolResults(context: Context): McpResult[] {
-	const { results, stopIdx } = _extractAllToolResults(context.messages as unknown as Array<{ role: string; [key: string]: unknown }>);
-	debug(`extractAllToolResults: ${results.length} results from ${context.messages.length} msgs, stopped at index ${stopIdx}`);
-	debug(`extractAllToolResults: all msg roles:`, context.messages.map((m, i) => `[${i}]${m.role}`).join(" "));
-	for (let r = 0; r < results.length; r++) {
-		debug(`extractAllToolResults: result[${r}] id=${results[r].toolCallId}${results[r].isError ? " ERROR" : ""} preview:`, JSON.stringify(results[r].content).slice(0, 150));
-	}
-	return results;
-}
-
-/** Index of the first message of the current user turn — the trailing run of
- *  user messages that has not been written into the Claude Code session yet.
- *  Equals messages.length when the last message is not a user message.
- *
- *  Single source of truth for the history/prompt split: everything before this
- *  index is replayed as session history, everything from it onward becomes the
- *  prompt. Deriving both halves from one index is what keeps a message from
- *  landing in both — an extension appending a display-only user message after
- *  the real one (see issue #34) makes the turn longer than one message. */
-function turnStart(messages: Context["messages"]): number {
-	let i = messages.length;
-	while (i > 0 && messages[i - 1].role === "user") i--;
-	return i;
-}
-
-/** Extract the current user turn as a prompt string. Returns null if the last message is not a user message. */
-function extractUserPrompt(messages: Context["messages"]): string | null {
-	const turn = messages.slice(turnStart(messages)) as UserMessage[];
-	if (turn.length === 0) return null;
-	// Drop empties before joining so an all-empty turn still yields "" and trips
-	// the caller's empty-prompt guard rather than sending bare newlines.
-	return turn
-		.map((m) => (typeof m.content === "string" ? m.content : messageContentToText(m.content)))
-		.filter((text) => text)
-		.join("\n");
-}
-
-/** Extract the current user turn as ContentBlockParam[] (preserving images).
- *  Returns null if no images — caller should fall back to string prompt. */
-function extractUserPromptBlocks(messages: Context["messages"]): ContentBlockParam[] | null {
-	const turn = messages.slice(turnStart(messages)) as UserMessage[];
-	if (turn.length === 0) return null;
-
-	let hasImage = false;
-	const blocks: ContentBlockParam[] = [];
-	for (const message of turn) {
-		const content: (TextContent | ImageContent)[] = typeof message.content === "string"
-			? [{ type: "text", text: message.content }]
-			: message.content;
-		// Off-type content violates UserMessage's contract, so fail rather than
-		// degrade — but name the shape, since the cause is almost always another
-		// extension appending a malformed message, not this file.
-		if (!Array.isArray(content)) {
-			throw new Error(
-				`extractUserPromptBlocks: user message content must be a string or block array, got ${typeof content} — likely a malformed message from another extension`,
-			);
-		}
-		for (const block of content) {
-			if (block.type === "text" && block.text) {
-				blocks.push({ type: "text", text: block.text });
-			} else if (block.type === "image") {
-				// Guard before logging: data-less image blocks do occur, and reading
-				// .length off the missing field in the debug template would throw
-				// before this check ever runs (template args evaluate unconditionally).
-				if (!block.data || !block.mimeType) {
-					debug(`image block missing data or mimeType, skipping: keys=${Object.keys(block).join(",")}`);
-					continue;
-				}
-				debug(`image block: mimeType=${block.mimeType}, data length=${block.data.length}`);
-				hasImage = true;
-				blocks.push({
-					type: "image",
-					source: {
-						type: "base64",
-						media_type: block.mimeType as Base64ImageSource["media_type"],
-						data: block.data,
-					},
-				});
-			}
-		}
-	}
-	debug(`extractUserPromptBlocks: ${turn.length} msgs in turn, ${blocks.length} blocks, types=${blocks.map((b) => b.type).join(",")}`);
-	return hasImage ? blocks : null;
-}
-
-function newAssistantOutput(model: Model<any>, text: string, stopReason: AssistantMessage["stopReason"], errorMessage?: string): AssistantMessage {
-	return {
-		role: "assistant",
-		content: text ? [{ type: "text", text }] : [],
-		api: model.api,
-		provider: model.provider,
-		model: model.id,
-		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-		stopReason,
-		...(errorMessage ? { errorMessage } : {}),
-		timestamp: Date.now(),
-	};
-}
-
-function extractIsolatedSummaryPrompt(messages: Context["messages"]): string {
-	if (messages.length !== 1 || messages[0].role !== "user") {
-		throw new Error(
-			`isolatedStreamFn: expected exactly 1 user message, got ${messages.length} ` +
-			`(${messages.map((m) => m.role).join(",")})`,
-		);
-	}
-	const promptText = extractUserPrompt(messages);
-	if (!promptText) throw new Error("isolatedStreamFn: summarization prompt is empty");
-	return promptText;
-}
-
-// pi 0.86.0 changed provider stream inputs from `Context` (carrying `systemPrompt`
-// and `tools` fields) to a normalized `TranscriptContext` whose prompt and tool
-// declarations are folded into a leading system message inside `messages`. This
-// bridge reads `context.systemPrompt` / `context.tools` and treats `messages` as
-// pure conversation, so reconstruct the old shape once at each provider entry.
-// It prefers explicit fields when present (a no-op on pre-0.86 inputs) and is
-// idempotent, so re-adapting an already-adapted context is harmless.
-function adaptContext(context: Context): Context {
-	const messages = context.messages ?? [];
-	const derivedSystemPrompt = typeof piAi.getCurrentSystemPrompt === "function" ? piAi.getCurrentSystemPrompt(messages) : undefined;
-	const derivedTools = typeof piAi.getCurrentTools === "function" ? piAi.getCurrentTools(messages) : undefined;
-	return {
-		systemPrompt: context.systemPrompt ?? (derivedSystemPrompt || undefined),
-		tools: context.tools ?? derivedTools,
-		messages: messages.filter((message) => message.role !== "system"),
-	};
 }
 
 function isolatedStreamFn(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
@@ -1535,15 +1403,6 @@ async function consumeQuery(
 	debug(`consumeQuery: for-await loop exited, wasAborted=${wasAborted()}, capturedSessionId=${capturedSessionId?.slice(0, 8) ?? "none"}`);
 
 	return { capturedSessionId };
-}
-
-/** The trailing user turn as content blocks, or null if there isn't one.
- *  Blocks rather than text so image steers keep their images. */
-function steerBlocks(messages: Context["messages"]): ContentBlockParam[] | null {
-	const blocks = extractUserPromptBlocks(messages);
-	if (blocks) return blocks;
-	const text = extractUserPrompt(messages);
-	return text ? [{ type: "text", text }] : null;
 }
 
 /** A steer that never made it into CC's session. The cursor has already counted
