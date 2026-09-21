@@ -1,7 +1,7 @@
 import { calculateCost, StringEnum, type AssistantMessage, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions, type Tool } from "@earendil-works/pi-ai";
 import * as piAi from "@earendil-works/pi-ai";
-import { getApiProvider, getModels, registerApiProvider, unregisterApiProviders } from "@earendil-works/pi-ai/compat";
-import { buildSessionContext, compact, generateBranchSummary, keyHint, type BranchSummaryResult, type CompactionEntry, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { getApiProvider, registerApiProvider, unregisterApiProviders } from "@earendil-works/pi-ai/compat";
+import { buildSessionContext, compact, generateBranchSummary, keyHint, type BranchSummaryResult, type CompactionEntry, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Type } from "typebox";
@@ -9,7 +9,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { createSession, deleteSession, openSession, repairToolPairing } from "cc-session-io";
 import { appendFileSync, realpathSync, statSync } from "fs";
 import { PROVIDER_ID, convertPiMessages } from "./convert.js";
-import { applyLongContext, buildModels, claudeCodeModelId, type LongContextSettings, resolveModel as _resolveModel } from "./models.js";
+import { claudeCodeModelId } from "./models.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, renderSkillsBlock } from "./skills.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
@@ -44,6 +44,21 @@ import { describeRateLimitFailure, errorMessage, resultErrorText } from "./error
 import { mapStopReason, mapToolArgs, mapToolName, parsePartialJson, piToolNameFor } from "./mapping.js";
 import { advanceCursor, adoptSession, clearSharedSession, getDeliveredToolResultCursor, getSharedSession, markNeedsRebuild, orphanedToolResultAction, recordToolResultDelivery, setCursor, setSharedSession, type SessionState } from "./session-store.js";
 import { adaptContext, extractAllToolResults, extractIsolatedSummaryPrompt, extractUserPrompt, extractUserPromptBlocks, newAssistantOutput, steerBlocks, turnStart } from "./pi-context.js";
+import { CC_CHILD_ENV, CLAUDE_MD_EXCLUDES, REASONING_TO_EFFORT, childEnv } from "./cc-child.js";
+import {
+	applyRuntimeConfig,
+	getAskClaudeToolName,
+	getLongContextSettings,
+	getPiMode,
+	getPiSessionId,
+	getPiUI,
+	getProviderSettings,
+	resolveModel,
+	setAskClaudeToolName,
+	setPiMode,
+	setPiSessionId,
+	setPiUI,
+} from "./runtime-config.js";
 
 // Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
 const _piAi = piAi as any;
@@ -51,71 +66,6 @@ const newAssistantMessageEventStream: () => AssistantMessageEventStream =
 	typeof _piAi.createAssistantMessageEventStream === "function"
 		? _piAi.createAssistantMessageEventStream
 		: () => new _piAi.AssistantMessageEventStream();
-
-// Applied to every Claude Code subprocess the bridge spawns — provider, AskClaude
-// and the compact summary. One place, so a guard is added once rather than three
-// times, and so a missing one is visible.
-//
-// - ENABLE_CLAUDEAI_MCP_SERVERS=0: keep the user's claude.ai-connected MCP servers
-//   out of a pi session, which serves its own tools.
-// - DISABLE_AUTO_COMPACT=1: pi owns compaction; CC compacting its own copy would
-//   diverge from pi's history, which is the source of truth for every rebuild.
-// - MUSTER_HOOK_DISABLE=1: the child inherits $TMUX and the pane's process
-//   ancestry, so the user's `muster hook` SessionStart/SessionEnd hooks would
-//   reclaim and then tombstone the hosting pi session's bus row on every
-//   request, leaving the pane permanently "departed" (muster >= 0.16 honors
-//   the guard).
-const CC_CHILD_ENV = {
-	ENABLE_CLAUDEAI_MCP_SERVERS: "0",
-	DISABLE_AUTO_COMPACT: "1",
-	MUSTER_HOOK_DISABLE: "1",
-} as const;
-
-// The process's TOP-LEVEL pi session, captured at session_start and stamped on
-// every Claude Code child as AGENT_SESSION_ID.
-//
-// Module scope is NOT per extension instance. pi 0.85.1's extension loader
-// caches the module per cwd and only re-invokes the factory (the default export)
-// for an in-process child session, so every instance in this process shares this
-// one variable — a naive capture on every session_start let a pi-subagents child
-// overwrite the parent's id. So: capture on "new", "resume" and "fork" (each
-// mints a new top-level id), and on "startup" only when nothing is captured yet.
-// pi's top-level session emits "startup" exactly once per process, and pi always
-// starts an in-process child session with reason "startup", so a later "startup"
-// is a child and never overwrites.
-//
-// Top-level is the identity the nested-harness consumers want: a Claude Code
-// child is a model call inside the top-level conversation, not a conversation of
-// its own. A child never inherits the host process's AGENT_SESSION_ID — that
-// inherited value is exactly what a sibling extension used to leave behind after
-// a subagent ran, and every Claude Code child spawned afterwards then announced
-// itself as the subagent's session.
-let piSessionId: string | undefined;
-
-// Builds a Claude Code child's environment: base, then identity, then the
-// CC_CHILD_ENV overrides. AGENT_SESSION_ID is ALWAYS a key in the result: set
-// when an id was captured, explicitly undefined when not, so spawn unsets it
-// rather than passing whatever base carried. Pure; never mutates base.
-function childEnv(base: NodeJS.ProcessEnv, captured: string | undefined): Record<string, string | undefined> {
-	return {
-		...base,
-		AGENT_SESSION_ID: captured?.trim() || undefined,
-		...CC_CHILD_ENV,
-	};
-}
-
-// Pi owns context files on the provider path, so Claude Code must not load its
-// own on top: otherwise a project CLAUDE.md arrives twice, and the user's
-// ~/.claude/CLAUDE.md — a persona written for a harness that is not the one
-// running — arrives at all, stamped "These instructions OVERRIDE any default
-// behavior" and outranking Pi's own AGENTS.md.
-//
-// Excludes rather than settingSources: the source gate that suppresses CLAUDE.md
-// is the same one that reads settings.json, where Bedrock/Vertex users keep
-// `env` and `apiKeyHelper`. Patterns are matched with picomatch against absolute
-// paths; "**/CLAUDE.md" covers the user, ancestor, project and .claude/ copies,
-// while rules need their own. Managed/policy memory is not excludable by design.
-const CLAUDE_MD_EXCLUDES = ["**/CLAUDE.md", "**/.claude/rules/**"];
 
 // --- Constants ---
 
@@ -150,15 +100,6 @@ let unregisterClaudeUsageAdapter: (() => void) | undefined;
 // `unifiedWindows`. The registered usage adapter prefers this over polling so the meter
 // reflects the freshest data the inference stream already delivered.
 let lastInlineUsageSnapshot: ProviderUsageSnapshotV1 | undefined;
-
-// MODELS is buildModels(getModels("anthropic")) — projection kept in models.js.
-const MODELS = buildModels(getModels("anthropic"));
-let providerSettings: NonNullable<Config["provider"]> = {};
-let longContextSettings: LongContextSettings = { plan: "pro", longContextExtraUsage: false };
-
-function resolveModel(input: string) {
-	return _resolveModel(MODELS, input);
-}
 
 // --- Error handling ---
 
@@ -295,14 +236,14 @@ async function runIsolatedSummary(
 		const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
 		const compactProviderSettings = loadConfig(cwd).provider;
 		const claudeExecutable = compactProviderSettings?.pathToClaudeCodeExecutable;
-		const cliModel = claudeCodeModelId(model, longContextSettings);
+		const cliModel = claudeCodeModelId(model, getLongContextSettings());
 		debug(`compact summary: spawn model=${cliModel} registeredModel=${model.id} promptLen=${promptText.length}`);
 
 		sdkQuery = query({
 			prompt: promptText,
 			options: {
 				cwd,
-				env: childEnv(process.env, piSessionId),
+				env: childEnv(process.env, getPiSessionId()),
 				settings: { autoMemoryEnabled: false },
 				tools: [],
 				strictMcpConfig: true,
@@ -409,7 +350,7 @@ function verifyWrittenSession(
 	const warnings = _verifyWrittenSession(jsonlPath, expectedSessionId, expectedRecordCount);
 	for (const msg of warnings) {
 		debug(`WARNING session verify: ${msg}`);
-		piUI?.notify(
+		getPiUI()?.notify(
 			`Session file issue: ${msg}\n` +
 			`cwd=${cwd} realpath=${safeRealpath(cwd)} CLAUDE_CONFIG_DIR=${process.env.CLAUDE_CONFIG_DIR ?? "(unset)"}\n` +
 			`Please copy and paste this message into a new issue at https://github.com/elidickinson/pi-claude-bridge/issues/new` +
@@ -600,9 +541,7 @@ export const __test = {
 	getSharedSession() {
 		return getSharedSession();
 	},
-	setPiUI(ui: ExtensionUIContext | null) {
-		piUI = ui;
-	},
+	setPiUI,
 	orphanedToolResultAction,
 	syncSharedSession,
 	buildSideRequestSession,
@@ -617,9 +556,7 @@ export const __test = {
 	drainForAbort,
 	CC_CHILD_ENV,
 	childEnv,
-	piSessionId() {
-		return piSessionId;
-	},
+	piSessionId: getPiSessionId,
 	buildMcpServers,
 	branchSummaryOutcome,
 	get promptCaptures() {
@@ -634,8 +571,6 @@ export const __test = {
 // activating the extension.
 
 // Global (not query state):
-let piUI: ExtensionUIContext | null = null;
-let piMode: ExtensionContext["mode"] | null = null;
 let standaloneWarningContext: StandaloneWarningContext | null = null;
 const activeQueryContexts = new Set<QueryContext>();
 
@@ -664,7 +599,7 @@ let pendingNotices: string[] = [];
 function showStartupNoticeOnce(): void {
 	// `hasUI` is true in RPC mode too — it means dialogs are possible, not that a
 	// human is watching. Only a terminal user can act on this.
-	if (pendingNotices.length === 0 || piMode !== "tui") return;
+	if (pendingNotices.length === 0 || getPiMode() !== "tui") return;
 	const notices = pendingNotices;
 	pendingNotices = [];
 	const path = markStartupNoticeShown();
@@ -672,7 +607,7 @@ function showStartupNoticeOnce(): void {
 	// drops back to the terminal default rather than dim, which is fine here.
 	const title = `\x1b[33mWelcome to pi-claude-bridge\x1b[39m — settings live in ${path}`;
 	const bullets = [...notices, "This message only appears once. See README.md for more."].map((n) => `• ${n}`);
-	piUI?.notify([title, ...bullets, "─".repeat(64)].join("\n"), "info");
+	getPiUI()?.notify([title, ...bullets, "─".repeat(64)].join("\n"), "info");
 }
 
 // Captures of what pi assembled per agent; see src/prompt-capture.ts for why this
@@ -987,15 +922,6 @@ function logServedContextWindow(label: string, message: SDKMessage, model: Model
 		debug(`${label}: served contextWindow=${v.contextWindow ?? "?"} maxOutputTokens=${v.maxOutputTokens ?? "?"} servedModel=${k} registered=${model.contextWindow}`);
 	}
 }
-
-// --- Effort level mapping ---
-// Pi reasoning levels → CC SDK effort levels
-
-const REASONING_TO_EFFORT: Record<string, EffortLevel> = {
-	minimal: "low", low: "low", medium: "medium", high: "high", xhigh: "max",
-};
-
-// --- Provider helpers: misc ---
 
 // --- Provider: streaming function ---
 //
@@ -1429,7 +1355,7 @@ async function deliverToolResults(
 	}
 	if (c.pendingToolCalls.size > 0) {
 		debug(`WARNING: ${c.pendingToolCalls.size} MCP handlers still waiting after delivering ${results.length} results`);
-		piUI?.notify(`Claude bridge: ${c.pendingToolCalls.size} tool handler(s) still waiting — provider may be stuck`, "warning");
+		getPiUI()?.notify(`Claude bridge: ${c.pendingToolCalls.size} tool handler(s) still waiting — provider may be stuck`, "warning");
 	}
 }
 
@@ -1593,7 +1519,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// Resolved first: an unaccountable system prompt throws, and doing that before
 	// anything is claimed or reset leaves no half-built query behind — in particular
 	// no stream claimed on the shared context that nobody will ever end.
-	const { mcpTools, customToolNameToSdk, customToolNameToPi } = resolveMcpTools(context, askClaudeToolName);
+	const { mcpTools, customToolNameToSdk, customToolNameToPi } = resolveMcpTools(context, getAskClaudeToolName());
 	// Build from what Pi loaded for this run, so `--no-context-files` and
 	// `--no-skills` reach Claude Code by leaving nothing to forward. A sub-agent's
 	// custom override embeds its parent's assembled Pi prompt; recursive projection
@@ -1625,7 +1551,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
 	// cliModel is the actual id sent to Claude Code (may carry [1m]); model.id is the
 	// pi-registered id. Log cliModel so debug lines reflect what CC actually received.
-	const cliModel = claudeCodeModelId(model, longContextSettings);
+	const cliModel = claudeCodeModelId(model, getLongContextSettings());
 	// A side request neither reads the shared session nor adopts one: its history is
 	// not pi's, so resuming pi's session would prepend a conversation the caller
 	// never sent. `preserveSharedSession` is what makes the completion handler treat
@@ -1677,8 +1603,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// token overhead. --strict-mcp-config tells the binary to use ONLY mcpServers passed
 	// programmatically and ignore filesystem MCP entries — applied unconditionally because
 	// settingSources is left at CC's default, which loads all sources.
-	const strictMcpConfigEnabled = providerSettings.strictMcpConfig !== false;
-	const claudeExecutable = providerSettings.pathToClaudeCodeExecutable;
+	const strictMcpConfigEnabled = getProviderSettings().strictMcpConfig !== false;
+	const claudeExecutable = getProviderSettings().pathToClaudeCodeExecutable;
 
 	// Prefer the model's own thinkingLevelMap when present (pi-ai 0.72+ ships
 	// per-model overrides — e.g. opus-4-7 wants xhigh→xhigh, not xhigh→max).
@@ -1706,7 +1632,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// Manual /compact in CC still works (we never invoke it).
 	const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
 		cwd,
-		env: childEnv(process.env, piSessionId),
+		env: childEnv(process.env, getPiSessionId()),
 		tools: [],
 		permissionMode: "bypassPermissions",
 		includePartialMessages: true,
@@ -1720,7 +1646,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		// path runs CC with `tools: []`, so those definitions never ship.
 		// AskClaude keeps CC's native tools and its guidance — unaffected.
 		settings: {
-			...claudeCodeSettings(providerSettings),
+			...claudeCodeSettings(getProviderSettings()),
 			claudeMdExcludes: CLAUDE_MD_EXCLUDES,
 			includeGitInstructions: false,
 		},
@@ -1894,7 +1820,7 @@ async function promptAndWait(
 	const requestedModel = options?.model ?? "opus";
 	const model = resolveModel(requestedModel);
 	const modelId = model?.id ?? requestedModel;
-	const cliModel = model ? claudeCodeModelId(model, longContextSettings) : modelId;
+	const cliModel = model ? claudeCodeModelId(model, getLongContextSettings()) : modelId;
 
 	// Session resume for shared mode — reuse provider's session if it exists,
 	// otherwise create one from pi's context.
@@ -1937,7 +1863,7 @@ async function promptAndWait(
 	const effort = options?.thinking && options.thinking !== "off"
 		? REASONING_TO_EFFORT[options.thinking] : undefined;
 
-	const claudeExecutable = providerSettings.pathToClaudeCodeExecutable;
+	const claudeExecutable = getProviderSettings().pathToClaudeCodeExecutable;
 
 	const extraArgs: Record<string, string | null> = {
 		"strict-mcp-config": null,
@@ -1959,9 +1885,9 @@ async function promptAndWait(
 		prompt,
 		options: {
 			cwd,
-			env: childEnv(process.env, piSessionId),
+			env: childEnv(process.env, getPiSessionId()),
 			permissionMode: "bypassPermissions",
-			settings: { ...claudeCodeSettings(providerSettings), claudeMdExcludes: CLAUDE_MD_EXCLUDES },
+			settings: { ...claudeCodeSettings(getProviderSettings()), claudeMdExcludes: CLAUDE_MD_EXCLUDES },
 			skills: [],
 			...(disallowedTools.length ? { disallowedTools } : {}),
 			...(effort ? { effort } : {}),
@@ -2069,21 +1995,13 @@ const DEFAULT_TOOL_DESCRIPTION = "Delegate to Claude Code for a second opinion o
 const PREVIEW_MAX_CHARS = 1000;
 const PREVIEW_MAX_LINES = 6;
 
-let askClaudeToolName = "AskClaude";
-
 export default function (pi: ExtensionAPI) {
 	// Disable non-essential Claude Code traffic (update checks, MCP registry, telemetry)
 	process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
 
 	const config = loadConfig(process.cwd());
 	debug("loadConfig:", JSON.stringify(config));
-	providerSettings = config.provider ?? {};
-	// We need these settings to know if we're eligible for 1M context on certain models
-	longContextSettings = {
-		plan: providerSettings.plan ?? "pro",
-		longContextExtraUsage: providerSettings.longContextExtraUsage ?? false,
-	};
-	const registeredModels = applyLongContext(MODELS, longContextSettings);
+	const registeredModels = applyRuntimeConfig(config);
 
 	let ownsUsageAdapter = false;
 	let ownedUsageAdapterOwner: ClaudeUsageAdapterOwner | undefined;
@@ -2122,8 +2040,8 @@ export default function (pi: ExtensionAPI) {
 	};
 	let ownsStandaloneWarningSession = false;
 	pi.on("session_start", (event, ctx) => {
-		piUI = ctx.ui;
-		piMode = ctx.mode;
+		setPiUI(ctx.ui);
+		setPiMode(ctx.mode);
 		// The factory that registered the singleton adapter owns its session state.
 		// Later in-process child factories share this module but cannot rebind it.
 		if (ownsUsageAdapter && ownedUsageAdapterOwner) {
@@ -2131,13 +2049,13 @@ export default function (pi: ExtensionAPI) {
 			beginStandaloneWarningSession(pi, ctx, event.reason === "fork");
 			ownsStandaloneWarningSession = true;
 		}
-		// Capture the top-level session only (see piSessionId above): "new",
+		// Capture the top-level session only (see runtime-config.js): "new",
 		// "resume" and "fork" each mint a new top-level id, while "startup" is
 		// captured only when nothing is held yet. This existing process-wide state
 		// is separate from the adapter's owner-bound refresh dependencies above.
-		if (event.reason === "new" || event.reason === "resume" || event.reason === "fork" || piSessionId === undefined) {
+		if (event.reason === "new" || event.reason === "resume" || event.reason === "fork" || getPiSessionId() === undefined) {
 			const sessionId = ctx.sessionManager?.getSessionId?.();
-			if (sessionId) piSessionId = sessionId;
+			if (sessionId) setPiSessionId(sessionId);
 		}
 		if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") {
 			clearSession(`session_start:${event.reason}`);
@@ -2355,7 +2273,7 @@ export default function (pi: ExtensionAPI) {
 	const allowFull = askConf?.allowFullMode !== false;
 	const defaultMode = askConf?.defaultMode ?? "read";
 	const defaultIsolated = askConf?.defaultIsolated ?? false;
-	askClaudeToolName = askConf?.name ?? "AskClaude";
+	setAskClaudeToolName(askConf?.name ?? "AskClaude");
 
 	const modeValues = allowFull ? ["read", "full", "none"] as const : ["read", "none"] as const;
 	let modeDesc = `"read" (default): questions about the codebase — review, analysis, explain. "none": general knowledge only (no file access).`;
