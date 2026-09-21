@@ -40,6 +40,8 @@ import {
 	type StandaloneWarningContext,
 } from "./usage-warning-state.js";
 import { DEBUG, DEBUG_LOG_PATH, RECORD_STREAM_PATH, debug, diagDump, makeCliDebugOptions, moduleInstanceId } from "./debug.js";
+import { describeRateLimitFailure, errorMessage, resultErrorText } from "./errors.js";
+import { mapStopReason, mapToolArgs, mapToolName, parsePartialJson, piToolNameFor } from "./mapping.js";
 
 // Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
 const _piAi = piAi as any;
@@ -147,12 +149,6 @@ let unregisterClaudeUsageAdapter: (() => void) | undefined;
 // reflects the freshest data the inference stream already delivered.
 let lastInlineUsageSnapshot: ProviderUsageSnapshotV1 | undefined;
 
-// Claude Code's own builtin tools, for the AskClaude path where CC really runs
-// them. The provider path never sees these — it starts CC with `tools: []`.
-const SDK_TO_PI_TOOL_NAME: Record<string, string> = {
-	read: "read", write: "write", edit: "edit", bash: "bash",
-};
-
 // MODELS is buildModels(getModels("anthropic")) — projection kept in models.js.
 const MODELS = buildModels(getModels("anthropic"));
 let providerSettings: NonNullable<Config["provider"]> = {};
@@ -163,17 +159,6 @@ function resolveModel(input: string) {
 }
 
 // --- Error handling ---
-
-function errorMessage(err: unknown): string {
-	if (err instanceof Error) return err.message;
-	if (err && typeof err === "object") {
-		const obj = err as Record<string, unknown>;
-		if (typeof obj.message === "string") return obj.message;
-		if (typeof obj.error === "string") return obj.error;
-		try { return JSON.stringify(err); } catch {}
-	}
-	return String(err);
-}
 
 // AskClaude mode presets — controls which CC tools are blocked per mode.
 // Only block tools that can't work (no pi TUI for user interaction).
@@ -443,35 +428,6 @@ function extractIsolatedSummaryPrompt(messages: Context["messages"]): string {
 	const promptText = extractUserPrompt(messages);
 	if (!promptText) throw new Error("isolatedStreamFn: summarization prompt is empty");
 	return promptText;
-}
-
-/** Failure text for an SDK result, or undefined when it succeeded. CC reports API failures
- *  (429 capacity, overload, prompt-too-long) with `is_error` on an otherwise success-shaped
- *  result; the dedicated error subtypes carry `errors` instead. */
-function resultErrorText(message: SDKMessage): string | undefined {
-	const result = message as SDKMessage & { subtype?: string; is_error?: boolean; result?: string; errors?: unknown; error?: unknown };
-	if (result.subtype === "success") return result.is_error ? result.result || "Claude Code reported an error" : undefined;
-	if (Array.isArray(result.errors) && result.errors.length) return result.errors.map(String).join("\n");
-	if (typeof result.error === "string") return result.error;
-	return `Claude Code failed: ${result.subtype ?? "unknown result"}`;
-}
-
-/** Name a failure as a rate limit when a rejection preceded it.
- *
- *  pi has no typed rate-limit error — `stopReason` is only ever `"error"` and the sole carrier
- *  is `errorMessage` — so everything that reacts to a rate limit pattern-matches that string:
- *  pi-subagents gates `fallbackModels` on a 35-pattern list, and key-rotating extensions use
- *  their own. Claude Code words a subscription limit as "You're out of extra usage · resets
- *  6:30pm", which matches none of them, so an exhausted quota reads as a fatal error and the
- *  fallback chain never runs (issue #58).
- *
- *  Leading with "Claude rate limit" rather than appending keeps the phrase in any truncated
- *  render, and avoids the `<tool> failed (exit N):` shape that pi-subagents treats as a tool
- *  failure and refuses to retry. */
-function describeRateLimitFailure(rejection: { rateLimitType?: string; resetsAt?: number }, failure: string): string {
-	const kind = rejection.rateLimitType ? ` (${rejection.rateLimitType})` : "";
-	const resets = rejection.resetsAt ? ` — resets ${new Date(rejection.resetsAt * 1000).toLocaleTimeString()}` : "";
-	return `Claude rate limit${kind}${resets}: ${failure}`;
 }
 
 // pi 0.86.0 changed provider stream inputs from `Context` (carrying `systemPrompt`
@@ -849,55 +805,6 @@ export const __test = {
 
 // --- Provider helpers: tool name mapping ---
 
-// AskClaude path: CC runs its own tools, so builtin names are real.
-function mapToolName(name: string): string {
-	const normalized = name.toLowerCase();
-	const builtin = SDK_TO_PI_TOOL_NAME[normalized];
-	if (builtin) return builtin;
-	if (normalized.startsWith(MCP_TOOL_PREFIX)) return name.slice(MCP_TOOL_PREFIX.length);
-	return name;
-}
-
-// Provider path: the query runs with `tools: []`, so the only tools CC can
-// legitimately call are the pi tools we serve over MCP. Any other name is the
-// model hallucinating a builtin (`bash`, `Bash`, `Edit`, an MCP server we don't
-// serve). CC answers those itself with "No such tool available" and retries
-// inside the same query, never dispatching them to our MCP server — so a tool
-// call under such a name must not reach pi. Forwarding one ran a tool CC never
-// dispatched (real side effects) and, because the retry carries a fresh
-// tool_use id, left the handler for the retry with no result to release it:
-// pi's result arrived keyed to the dead id, and both sides deadlocked.
-function piToolNameFor(name: string, customToolNameToPi: Map<string, string>): string | undefined {
-	return customToolNameToPi.get(name) ?? customToolNameToPi.get(name.toLowerCase());
-}
-
-// Renames for Claude Code SDK param names that differ from pi's native names.
-// Keys not listed here pass through unchanged, so new pi params work automatically.
-const SDK_KEY_RENAMES: Record<string, Record<string, string>> = {
-	read:  { file_path: "path" },
-	write: { file_path: "path" },
-	edit:  { file_path: "path", old_string: "oldText", new_string: "newText", old_text: "oldText", new_text: "newText" },
-};
-
-// Maps SDK tool args to pi tool args via key renaming + pass-through.
-// Pi's own prepareArguments hooks handle any structural transforms (e.g. edit oldText/newText → edits[]).
-function mapToolArgs(
-	toolName: string, args: Record<string, unknown> | undefined,
-): Record<string, unknown> {
-	const input = args ?? {};
-	const renames = SDK_KEY_RENAMES[toolName.toLowerCase()];
-	const result: Record<string, unknown> = {};
-	for (const [key, value] of Object.entries(input)) {
-		const piKey = renames?.[key] ?? key;
-		if (!(piKey in result)) result[piKey] = value; // first alias wins
-	}
-	// Pi bash has no default timeout; add a safety default
-	if (toolName.toLowerCase() === "bash" && result.timeout == null) {
-		result.timeout = 120;
-	}
-	return result;
-}
-
 // --- Query state ---
 // QueryContext lives in query-state.js so tests can import it without
 // activating the extension.
@@ -1265,20 +1172,6 @@ const REASONING_TO_EFFORT: Record<string, EffortLevel> = {
 };
 
 // --- Provider helpers: misc ---
-
-function mapStopReason(reason: string | undefined): "stop" | "length" | "toolUse" {
-	switch (reason) {
-		case "tool_use": return "toolUse";
-		case "max_tokens": return "length";
-		case "end_turn": default: return "stop";
-	}
-}
-
-function parsePartialJson(input: string, fallback: Record<string, unknown>): Record<string, unknown> {
-	if (!input) return fallback;
-	try { return JSON.parse(input); } catch { return fallback; }
-}
-
 
 // --- Provider: streaming function ---
 //
