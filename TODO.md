@@ -13,18 +13,18 @@ that does not exist yet, or on someone else's repo.
    for. The discriminator must be **reentrancy, not message count**: the
    shorter-context branch in `syncSharedSession` is also the guard that stops a
    subagent resuming and overwriting the parent's session, and a subagent's priors
-   are not empty. `isReentrant` is already computed at `src/index.ts:1354`,
-   immediately before the call at `:1375`, and just isn't passed in. The stale
+   are not empty. `isReentrant` is already computed at `src/provider.ts:275`,
+   immediately before the call at `src/provider.ts:327`, and just isn't passed in. The stale
    `fix/issue-30-pruned-history` branch discriminates on `priorMessages.length === 0`
    and would break subagent isolation — do not merge it. Decide deliberately what
-   the AskClaude caller at `:1625` should pass. Guarded by
+   the AskClaude caller at `src/askclaude.ts:95` should pass. Guarded by
    `unit-sync-shared-session.mjs` plus `int-subagent-rpiv-codebase-locator.mjs`.
 
 2. **Make the dropped-thinking-signature rate visible.** 26 of 2,363
    `claude-bridge` thinking blocks carry an empty `thinkingSignature`, so
    `src/convert.ts:135` correctly refuses to replay them (Anthropic rejects
    unverifiable signatures) — but silently. A WARNING at the `?? ""` site
-   (`src/index.ts:1056`) turns a 1.1% invisible loss into a number, which is the
+   (`src/stream-events.ts:214`) turns a 1.1% invisible loss into a number, which is the
    prerequisite for ever explaining it.
 
    Partly covered now: `convertPiMessages` returns a `dropped` summary and
@@ -33,7 +33,7 @@ that does not exist yet, or on someone else's repo.
    empty-signature case still needs the WARNING at `:1056` to tell "we minted
    nothing" apart from "another provider minted it".
 
-3. **Delete `reasoningText`** (`src/index.ts:825`): `reasoning=` appears in 0 of
+3. **Delete `reasoningText`** (`src/usage.ts:219`): `reasoning=` appears in 0 of
    14,994 `usage:` lines, so the SDK never supplies the field. Right now it reads
    as a working diagnostic. Delete it or record why it stays.
 
@@ -254,8 +254,8 @@ Ranked by leverage per effort:
    never hand-written; a test must drive the real object through its real entry point
    rather than a model of it. Corollary: a regression test never observed failing
    without its fix is not evidence.
-4. **`strictNullChecks`.** Exactly 27 errors today (13 `convert.ts`, 9 `index.ts`,
-   5 `session-verify.ts`). The tsconfig comment fears `!` noise, but each forced `!`
+4. **`strictNullChecks`.** Exactly 27 errors today (13 `convert.ts`, 8 `stream-events.ts`,
+   5 `session-verify.ts`, 1 `provider.ts`). The tsconfig comment fears `!` noise, but each forced `!`
    marks a nullable-at-type-level, non-null-by-invariant claim — the exact category of
    unchecked belief that keeps biting. Hygiene, not strategy: it catches its own class
    and nothing else.

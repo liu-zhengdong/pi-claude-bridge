@@ -1,4 +1,4 @@
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ProviderUsageEventV1, UsageProviderV1 } from "./usage-bus.js";
 
 export const PROVIDER_USAGE_WARNING_ENTRY_TYPE = "provider-usage:warning-v1";
@@ -55,6 +55,38 @@ export function resetStandaloneWarningState(ctx: SessionEntriesContext = {}): vo
 	shownSoftWarnings.clear();
 	ignoredForkMarkers.clear();
 	for (const [provider, count] of validMarkerCounts(ctx)) ignoredForkMarkers.set(provider, count);
+}
+
+// The pi session this process can fall back to when nothing is listening on the
+// usage bus. Null between sessions, and for every in-process child instance that
+// did not claim the usage adapter.
+let standaloneWarningContext: StandaloneWarningContext | null = null;
+
+/** Bind the running pi session as the fallback UI, and start its once-per-provider
+ *  allowance — fresh for a fork, restored from durable entries otherwise. */
+export function beginStandaloneWarningSession(
+	pi: Pick<ExtensionAPI, "appendEntry">,
+	ctx: Pick<ExtensionContext, "sessionManager" | "ui">,
+	fork: boolean,
+): void {
+	standaloneWarningContext = {
+		appendEntry: (customType, data) => { pi.appendEntry(customType, data); },
+		sessionManager: ctx.sessionManager,
+		ui: ctx.ui,
+	};
+	if (fork) resetStandaloneWarningState(ctx);
+	else restoreStandaloneWarningState(ctx);
+}
+
+/** The session is gone, so there is no UI left to fall back to. */
+export function endStandaloneWarningSession(): void {
+	standaloneWarningContext = null;
+}
+
+/** Fallback UI for an event the bus delivered to nobody. A no-op when no session
+ *  is bound, which is what keeps a child instance from notifying on its own. */
+export function notifyIfStandalone(event: Exclude<ProviderUsageEventV1, { type: "snapshot" }>): void {
+	if (standaloneWarningContext) notifyWithStandaloneSessionPolicy(event, standaloneWarningContext);
 }
 
 /** Fallback UI used only when the provider-usage bus has no listeners. */
