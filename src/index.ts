@@ -27,21 +27,28 @@ import { beginStandaloneWarningSession, endStandaloneWarningSession } from "./us
 
 // --- Registration guards ---
 
-// Global key to prevent re-registration of the provider across module reloads.
+// Which module instance serves a bridge query, in a Symbol.for() global so every
+// instance in the process reads the same answer.
 //
-// Extensions like pi-subagents spawn a subagent and it loads this module
-// again. Without this guard, the subagent's call to registerProvider() would
-// overwrite the parent's `streamSimple` function reference in the shared
-// ModelRegistry. When the parent later delivers a tool result, it would call
-// the subagent's `streamSimple` (which has empty state) instead of its own.
+// Extensions like pi-subagents spawn a subagent and it activates this extension
+// again. The instance that registered first is the one holding the in-flight
+// QueryContexts, so a tool result has to come back to it; handing pi a later
+// instance's `streamProviderEntry` would deliver into empty state.
 //
-// By storing the active streamSimple in a Symbol.for() global (shared across all
-// module instances), we ensure only the FIRST instance to register takes effect.
-// Subsequent instances wrap the stored function instead of overwriting it.
+// That is a question about the *function*, not about the registration. pi's
+// ModelRegistry is per session — each ExtensionRunner holds its own — so an
+// activation that skips registerProvider leaves that session with no
+// claude-bridge models at all, which is what made them come and go. Every
+// activation registers; what it registers is `activeStreamSimple`, a shell that
+// reads this global per call. Re-registration is then idempotent.
 //
-// On session_shutdown (including /reload), clearSession() resets this so a fresh
-// registration can occur for the next session.
+// On session_shutdown (including /reload), clearSession() releases ownership if
+// this instance held it, so the next activation can claim it.
 const ACTIVE_STREAM_SIMPLE_KEY = Symbol.for("claude-bridge:activeStreamSimple");
+
+/** Registered as the provider's streamSimple: resolve the owning instance per call. */
+const activeStreamSimple: typeof streamProviderEntry = (model, context, options) =>
+	((globalThis as Record<symbol, any>)[ACTIVE_STREAM_SIMPLE_KEY] ?? streamProviderEntry)(model, context, options);
 
 // Ours among pi-ai's api-provider registrations, so shutdown removes only the one
 // this module instance made. Per instance, not per package: a subagent instance
@@ -105,9 +112,9 @@ export default function (pi: ExtensionAPI) {
 		debug(`${event}: clearing session ${getSharedSession()?.sessionId?.slice(0, 8) ?? "none"}`);
 		clearSharedSession();
 
-		// Clear the global streamSimple if this instance registered it.
-		// This allows /reload to work — the old instance clears the flag so
-		// the new instance can register fresh without wrapping stale state.
+		// Release ownership if this instance held it. This allows /reload to work —
+		// the old instance steps down so the next activation claims ownership
+		// instead of forwarding into a shut-down instance.
 		const g = globalThis as Record<symbol, any>;
 		if (g[ACTIVE_STREAM_SIMPLE_KEY] === streamProviderEntry) {
 			debug(`${event}: clearing ACTIVE_STREAM_SIMPLE_KEY`);
@@ -254,30 +261,28 @@ export default function (pi: ExtensionAPI) {
 
 	// --- Provider ---
 	//
-	// Guard against re-registration when the module is loaded multiple times
-	// (e.g., when spawning subagents). The shared ModelRegistry would otherwise
-	// overwrite the parent's streamSimple, breaking tool result delivery.
+	// Every activation registers — the ModelRegistry it registers into belongs to
+	// this session alone. Only the streamSimple is shared, and it is shared by
+	// forwarding rather than by skipping registration.
 	// See ACTIVE_STREAM_SIMPLE_KEY for the full mechanism.
 
 	const g = globalThis as Record<symbol, any>;
 	if (!g[ACTIVE_STREAM_SIMPLE_KEY]) {
-		// First instance: store our streamSimple and register.
 		g[ACTIVE_STREAM_SIMPLE_KEY] = streamProviderEntry;
-		pi.registerProvider(PROVIDER_ID, {
-			baseUrl: "claude-bridge",
-			apiKey: "not-used",
-			api: "claude-bridge",
-			models: registeredModels,
-			// Cast: pi-ai AssistantMessageEventStream diamond dep between pi-coding-agent and pi-agent-core
-			streamSimple: streamProviderEntry as any,
-		});
 	} else {
-		// Subsequent instance (subagent session): skip registration entirely.
-		// The subagent already has access to claude-bridge models via the shared
-		// ModelRegistry from the parent's registration. Calls to those models
-		// route through the parent's streamSimple via reentrant QueryContexts.
-		debug(`provider: skipping re-registration, parent instance active (module=${moduleInstanceId})`);
+		// Another instance owns the in-flight state (e.g. this is a subagent
+		// session): its models are registered here all the same, and calls to them
+		// reach the owner through activeStreamSimple via reentrant QueryContexts.
+		debug(`provider: registering with forwarding streamSimple, another instance owns queries (module=${moduleInstanceId})`);
 	}
+	pi.registerProvider(PROVIDER_ID, {
+		baseUrl: "claude-bridge",
+		apiKey: "not-used",
+		api: "claude-bridge",
+		models: registeredModels,
+		// Cast: pi-ai AssistantMessageEventStream diamond dep between pi-coding-agent and pi-agent-core
+		streamSimple: activeStreamSimple as any,
+	});
 
 	// pi's model runtime is not the only route to a bridge model. An extension that
 	// drives its own agentLoop is served by pi-ai's default stream function, which
