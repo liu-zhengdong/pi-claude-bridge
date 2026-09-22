@@ -14,6 +14,7 @@ import { PROVIDER_ID } from "./convert.js";
 import { debug, moduleInstanceId } from "./debug.js";
 import { errorMessage, resultErrorText } from "./errors.js";
 import { branchSummaryOutcome, isolatedStreamFn, reinjectPriorCompactionFileOps } from "./isolated-summary.js";
+import { createModelCatalogRefresher, readDiscoveredModelIds } from "./model-discovery.js";
 import { extractUserPromptBlocks } from "./pi-context.js";
 import { createPromptRecorder, promptCaptures } from "./prompt-record.js";
 import { buildMcpServers, reportLeaks, streamProviderEntry, streamSideRequest } from "./provider.js";
@@ -96,7 +97,9 @@ export default function (pi: ExtensionAPI) {
 
 	const config = loadConfig(process.cwd());
 	debug("loadConfig:", JSON.stringify(config));
-	const registeredModels = applyRuntimeConfig(config);
+	// Cached discoveries seed the first registration too, so snapshot-only
+	// consumers (and `pi --list-models`) see them before any refresh runs.
+	const registeredModels = applyRuntimeConfig(config, readDiscoveredModelIds());
 
 	// Null for an in-process child instance: the top-level session already owns
 	// the adapter, and this instance must neither rebind nor unregister it.
@@ -280,6 +283,9 @@ export default function (pi: ExtensionAPI) {
 		apiKey: "not-used",
 		api: "claude-bridge",
 		models: registeredModels,
+		// pi runs this on startup (cached ids only) and again when the model picker
+		// opens (may probe the CLI for models this catalog predates).
+		refreshModels: createModelCatalogRefresher({ cwd: process.cwd(), provider: config.provider }),
 		// Cast: pi-ai AssistantMessageEventStream diamond dep between pi-coding-agent and pi-agent-core
 		streamSimple: activeStreamSimple as any,
 	});

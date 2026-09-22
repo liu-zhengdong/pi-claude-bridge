@@ -42,11 +42,22 @@ describe("provider registration", () => {
 			assert.equal(registrations.length, 1, `${label} activation must register the provider`);
 			assert.equal(registrations[0].name, "claude-bridge");
 			assert.ok(registrations[0].config.models.length > 0, `${label} activation must register models`);
+			assert.equal(typeof registrations[0].config.refreshModels, "function", `${label} activation must wire the discovery hook`);
 		}
 		assert.deepEqual(
 			second.registrations[0].config.models.map((model) => model.id),
 			first.registrations[0].config.models.map((model) => model.id),
 			"a later activation registers the same model list as the first",
+		);
+	});
+
+	it("restores the registration list when nothing has been discovered", async () => {
+		const { registrations } = activateWithMockPi();
+		const restored = await registrations[0].config.refreshModels({ allowNetwork: false, signal: new AbortController().signal });
+		assert.deepEqual(
+			restored.map((model) => model.id),
+			registrations[0].config.models.map((model) => model.id),
+			"the restore phase serves exactly what was registered",
 		);
 	});
 

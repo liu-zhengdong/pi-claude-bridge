@@ -17,20 +17,29 @@ let providerSettings: NonNullable<Config["provider"]> = {};
 let longContextSettings: LongContextSettings = { plan: "pro", longContextExtraUsage: false };
 
 /**
+ * The registered model list: the static catalog plus any runtime-discovered ids
+ * (model-discovery.ts), with long-context entitlement applied. Discovered ids
+ * lead the list so partial matches resolve to the newest model.
+ */
+export function buildModelCatalog(discoveredIds: readonly string[] = []) {
+	return applyLongContext(buildModels(getModels("anthropic"), discoveredIds), longContextSettings);
+}
+
+/**
  * Adopt the config the extension just loaded. Written once per activation.
  *
  * Returns the model list with long-context entitlement applied, which is what
  * `pi.registerProvider` takes — derived here because the entitlement is read off
  * the same settings this call is adopting.
  */
-export function applyRuntimeConfig(config: Config) {
+export function applyRuntimeConfig(config: Config, discoveredIds: readonly string[] = []) {
 	providerSettings = config.provider ?? {};
 	// We need these settings to know if we're eligible for 1M context on certain models
 	longContextSettings = {
 		plan: providerSettings.plan ?? "pro",
 		longContextExtraUsage: providerSettings.longContextExtraUsage ?? false,
 	};
-	return applyLongContext(MODELS, longContextSettings);
+	return buildModelCatalog(discoveredIds);
 }
 
 export function getProviderSettings(): NonNullable<Config["provider"]> {

@@ -216,3 +216,31 @@ describe("models absent from pi-ai's snapshot", () => {
 		});
 	});
 });
+
+describe("runtime-discovered siblings", () => {
+	const all = () => MODEL_IDS_IN_ORDER.map(mockPiAiModel);
+
+	it("derives a discovered id from its longest numeric-suffix sibling", () => {
+		const models = buildModels(all(), ["claude-opus-5-5"]);
+		assert.equal(models[0].id, "claude-opus-5-5");
+		assert.equal(models[0].name, "claude-opus-5.5", "sibling name plus the numeric segment");
+		assert.equal(models[0].reasoning, true, "inherits the base entry's metadata");
+		assert.deepEqual(models.slice(1).map((m) => m.id), MODEL_IDS_IN_ORDER, "static order is untouched");
+	});
+
+	it("keeps the static slot's position when a discovery is already cataloged", () => {
+		const models = buildModels(all(), ["claude-sonnet-5"]);
+		assert.deepEqual(models.map((m) => m.id), MODEL_IDS_IN_ORDER);
+	});
+
+	it("drops a discovered id with no plausible sibling", () => {
+		const models = buildModels(all(), ["claude-nova-9"]);
+		assert.deepEqual(models.map((m) => m.id), MODEL_IDS_IN_ORDER);
+	});
+
+	it("inherits the sibling's runtime policy with the full id requested", () => {
+		assert.deepEqual(resolveClaudeCodeRuntimeModel("claude-opus-5-5", PRO), { cliModelId: "claude-opus-5-5[1m]", contextWindow: 1000000 });
+		assert.deepEqual(resolveClaudeCodeRuntimeModel("claude-opus-4-6-1", PRO), { cliModelId: "claude-opus-4-6-1", contextWindow: 200000 });
+		assert.deepEqual(resolveClaudeCodeRuntimeModel("claude-sonnet-4-6-1", EXTRA), { cliModelId: "claude-sonnet-4-6-1[1m]", contextWindow: 1000000 });
+	});
+});

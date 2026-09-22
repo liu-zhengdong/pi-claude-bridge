@@ -23,7 +23,9 @@ pi install npm:pi-claude-bridge
 
 ## Provider
 
-Use `/model` to select `claude-bridge/claude-fable-5`, `claude-bridge/claude-opus-5`, `claude-bridge/claude-opus-4-8`, `claude-bridge/claude-opus-4-7`, `claude-bridge/claude-opus-4-6`, `claude-bridge/claude-sonnet-5`, `claude-bridge/claude-sonnet-4-6`, or `claude-bridge/claude-haiku-4-5`.
+Use `/model` to select `claude-bridge/claude-fable-5-1`, `claude-bridge/claude-fable-5`, `claude-bridge/claude-opus-5`, `claude-bridge/claude-opus-4-8`, `claude-bridge/claude-opus-4-7`, `claude-bridge/claude-opus-4-6`, `claude-bridge/claude-sonnet-5`, `claude-bridge/claude-sonnet-4-6`, or `claude-bridge/claude-haiku-4-5`.
+
+The list isn't fixed: the bridge asks the active Claude Code CLI which models it serves (`supportedModels()`) and adds any this catalog doesn't have yet, inheriting metadata and context policy from the closest sibling — `claude-opus-5-5` from `claude-opus-5`, say. A fresh cached answer skips the probe, so it runs on first use and roughly daily after; the cache lives at `~/.pi/agent/claude-bridge-models.json` (`CLAUDE_BRIDGE_MODELS_CACHE` overrides the path), and a failed probe just keeps it.
 
 Behind the scenes, pi's tools are bridged to Claude Code but it should all work like normal in pi. Bash commands get a 120-second default timeout (matching Claude Code's default) since pi's bash has no timeout by default. Skills in pi are copied over to Claude Code's system prompt so should work as they would with any other pi provider. Steering works mid-turn: a message sent while Claude is running a tool reaches it at that tool boundary, not after the whole turn finishes.
 
@@ -96,7 +98,7 @@ Config: `~/.pi/agent/claude-bridge.json` (global) or the project Pi config direc
 
 ## Tests
 
-`npm run test:unit` for offline tests (`tests/unit-*.mjs`: queue, import, skills). 
+`npm run test:unit` for offline tests (`tests/unit-*.mjs`: queue, import, skills, model discovery). 
 
 `npm test` for the full suite, which adds integration tests that hit APIs (`tests/int-*.{sh,mjs}`: smoke, multi-turn, cache, session-resume, session-rebuild, tool-message). Set `CLAUDE_BRIDGE_TESTING_ALT_MODEL` in `.env.test` for the alt-provider smoke test (e.g. `openrouter/z-ai/glm-4.7-flash`).
 
