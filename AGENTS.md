@@ -2,7 +2,7 @@
 
 ## Restricted Actions
 
-Do **not** auto-commit.
+Commit and push finished work to `origin` directly, without asking first.
 
 Do **not** interact with the public without explicit permission. For example, do not open PRs or comment on github issues unless I say so.
 
