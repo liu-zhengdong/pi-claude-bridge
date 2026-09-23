@@ -17,42 +17,30 @@ describe("syncSharedSession", () => {
 		__test.setPiUI(null);
 	});
 
-	// The branch this exercises is the guard that stops a reentrant subagent from
-	// resuming — and then overwriting — the parent's session: a subagent's context
-	// is shorter than the parent's cursor, so it starts fresh and the parent's
-	// session is preserved. It was previously described here as the compact-summary
-	// path, which cannot reach syncSharedSession at all, so the branch read as
-	// covered for a case that never happens.
-	it("starts a fresh session for a shorter context and preserves the parent's", () => {
+	// Issue #16. ACP compacts through the `context` hook and never emits
+	// session_compact, so pi's own history arrives shorter than the cursor with
+	// needsRebuild unset. This used to be read as a subagent's context and answered
+	// with an empty session holding only the new prompt. Subagents are now told
+	// apart by the caller (ownsSharedSession, below) and never reach this function.
+	it("rebuilds from pi's history when it comes back shorter than the cursor", () => {
 		const cwd = mkdtempSync(join(tmpdir(), "sync-shared-session-"));
+		const sessionId = "11111111-1111-4111-8111-111111111111";
 		try {
-			const mainSession = {
-				sessionId: "11111111-1111-4111-8111-111111111111",
-				cursor: 42,
-				cwd,
-			};
-			__test.setSharedSession(mainSession);
+			__test.setSharedSession({ sessionId, cursor: 42, cwd });
 
 			const result = __test.syncSharedSession([
-				{
-					role: "user",
-					content: "Summarize this conversation.",
-					timestamp: Date.now(),
-				},
+				{ role: "user", content: "[summary of the compacted turns]", timestamp: Date.now() },
+				{ role: "assistant", content: [{ type: "text", text: "The codeword was BANANA." }], timestamp: Date.now() },
+				{ role: "user", content: "Which codeword?", timestamp: Date.now() },
 			], cwd);
 
-			assert.equal(
-				result.sessionId,
-				null,
-				"a context shorter than the cursor — a subagent, or AskClaude — must start a fresh Claude Code session instead of resuming the parent's",
-			);
-			assert.equal(
-				result.preserveSharedSession,
-				true,
-				"the fresh session must not replace the parent's when it completes",
-			);
-			assert.deepEqual(__test.getSharedSession(), mainSession);
+			assert.equal(result.sessionId, sessionId, "pi's turn must resume its own session, rewritten in place — not an empty one");
+			assert.ok(!result.preserveSharedSession, "the rewritten session is pi's, so it stays the shared one");
+			assert.equal(__test.getSharedSession().cursor, 2, "the cursor must restart from the rewritten history");
+			const written = openSession({ sessionId, projectPath: cwd });
+			assert.equal(written.messages.length, 2, "the rewritten history must reach Claude Code");
 		} finally {
+			deleteSession(sessionId, cwd);
 			rmSync(cwd, { recursive: true, force: true });
 		}
 	});
@@ -105,4 +93,24 @@ describe("syncSharedSession", () => {
 			rmSync(cwd, { recursive: true, force: true });
 		}
 	});
+});
+
+// Who may resume or rewrite the shared session. Getting this wrong in either
+// direction loses a conversation: pi's own turn sent elsewhere starts from
+// nothing, and a subagent let in takes over the parent's session mid-turn.
+describe("ownsSharedSession", () => {
+	const PI = "01a0cd2e-2a8a-73dd-8b79-8732f6dc5a7f";
+	const cases = [
+		["pi's own turn", { side: false, activeQuery: false, sessionId: PI }, PI, true],
+		["a side request", { side: true, activeQuery: false, sessionId: PI }, PI, false],
+		["a subagent inside a tool call of pi's live query", { side: false, activeQuery: true, sessionId: PI }, PI, false],
+		["another agent session in this process", { side: false, activeQuery: false, sessionId: "child-session" }, PI, false],
+		["a caller that sends no session id", { side: false, activeQuery: false }, PI, true],
+		["before pi's session id is known", { side: false, activeQuery: false, sessionId: PI }, undefined, true],
+	];
+	for (const [label, call, piSessionId, expected] of cases) {
+		it(`${expected ? "admits" : "turns away"} ${label}`, () => {
+			assert.equal(__test.ownsSharedSession(call, piSessionId), expected);
+		});
+	}
 });

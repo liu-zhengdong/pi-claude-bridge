@@ -103,6 +103,37 @@ export interface SyncResult {
 }
 
 /**
+ * Whether a fresh query is pi's own conversation — the only caller allowed to
+ * resume or rewrite the shared session.
+ *
+ * Everything else gets a throwaway session holding its own history
+ * (`buildSideRequestSession`): a side request; a query that arrives while pi's
+ * conversation has one in flight, i.e. a subagent running inside a tool call; and
+ * a call from another agent session in this process, which pi tags with that
+ * session's id.
+ *
+ * This used to be inferred from the history instead: a context shorter than the
+ * cursor was taken to be a subagent's. An extension that compacts through the
+ * `context` hook (ACP) shortens pi's own history the same way without emitting
+ * `session_compact`, so pi's next turn was served by an empty Claude Code session
+ * that knew nothing of the conversation (issue #16).
+ *
+ * Pure, so every combination is tested without a live query — see
+ * tests/unit-sync-shared-session.mjs.
+ */
+export function ownsSharedSession(
+	call: { side: boolean; activeQuery: boolean; sessionId?: string },
+	piSessionId: string | undefined,
+): boolean {
+	if (call.side || call.activeQuery) return false;
+	// Pi's agent sends its session id with every request. When either side is
+	// missing there is nothing to compare, so the call keeps the old default and
+	// counts as pi's own.
+	if (call.sessionId === undefined || piSessionId === undefined) return true;
+	return call.sessionId === piSessionId;
+}
+
+/**
  * Ensure the shared session has all messages up to (but not including) the last user message.
  * Returns session ID to resume from, or null if no resume needed.
  */
@@ -153,13 +184,14 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 	debug(`${label}: env.CLAUDE_CONFIG_DIR=${process.env.CLAUDE_CONFIG_DIR ?? "(unset)"} HOME=${process.env.HOME ?? "(unset)"}`);
 }
 
-// Two semantic paths:
+// Only for pi's own conversation — see ownsSharedSession. Two semantic paths:
 //   REUSE — pi's history is in sync with the existing sharedSession (or drifted
 //     only by the trailing final-assistant message that pi appends after
 //     streamSimple returns, which CC's own persisted session already has).
 //     Returns the existing sessionId. Keeps CC's prompt cache warm.
 //   REBUILD — no session yet, or pi's history has diverged (non-trailing
-//     missed messages, e.g. another provider took a turn). Wipes the existing
+//     missed messages, e.g. another provider took a turn; or a history shorter
+//     than the cursor, which pi or an extension rewrote). Wipes the existing
 //     session file (if any) and writes a fresh one containing all prior
 //     messages, reusing the same sessionId across rebuilds so UUIDs stay
 //     stable for the lifetime of pi's session.
@@ -193,6 +225,11 @@ export function syncSharedSession(
 	// pi-side history rewrites such as /compact and session_tree: without it,
 	// missed = [].slice(cursor) can falsely hit REUSE and resume an unrelated
 	// longer CC session. See issue #25.
+	//
+	// A shorter context falls through to REBUILD. /compact, session_tree, /new and
+	// fork announce themselves and set needsRebuild or clear the session first; an
+	// extension compacting through the `context` hook (ACP) does not, and this guard
+	// is the only place its rewrite shows.
 	const existing = getSharedSession();
 	if (existing && !existing.needsRebuild && priorMessages.length >= existing.cursor) {
 		const missed = priorMessages.slice(existing.cursor);
@@ -209,27 +246,10 @@ export function syncSharedSession(
 			return { sessionId: session.sessionId };
 		}
 	}
-	// This is what keeps a reentrant subagent from taking over the parent's
-	// session: a subagent starts with priors of its own, shorter than the parent's
-	// cursor, so it lands here, gets a fresh session, and the ephemeral session it
-	// captures is deleted once its query completes (see preserveSharedSession in
-	// the completion handler). Remove this branch and a subagent resumes — then
-	// overwrites — the parent's session. The non-isolated AskClaude path reaches it
-	// the same way.
-	//
-	// It is NOT, despite an earlier comment here, the isolated compact-summary
-	// path: runIsolatedSummary never calls syncSharedSession at all.
-	//
-	// Only reachable when needsRebuild is false — user-facing history rewrites
-	// (/compact, session_tree, /new, fork) always set needsRebuild or clear
-	// sharedSession before the next syncSharedSession call.
-	if (existing && !existing.needsRebuild && priorMessages.length < existing.cursor) {
-		debug(`Case 1 synthetic: clean start for shorter context, preserving shared session ${existing.sessionId.slice(0, 8)}, cursor=${existing.cursor}`);
-		debug(`syncResult: path=clean-start preserve-shared sessionId=${existing.sessionId} cursor=${existing.cursor}`);
-		return { sessionId: null, preserveSharedSession: true };
-	}
-
 	// REBUILD path
+	if (existing && !existing.needsRebuild && priorMessages.length < existing.cursor) {
+		debug(`Case 4 rewritten: ${priorMessages.length} prior messages, fewer than cursor=${existing.cursor} — pi's history was rewritten without session_compact`);
+	}
 	if (priorMessages.length === 0) {
 		debug(`Case 1: clean start, ${messages.length} total messages`);
 		debug(`syncResult: path=clean-start`);
@@ -274,11 +294,13 @@ export function syncSharedSession(
 }
 
 /**
- * A throwaway Claude Code session holding a side request's own prior messages.
+ * A throwaway Claude Code session holding the prior messages of a query that is
+ * not pi's own conversation: a side request, or any other caller that
+ * `ownsSharedSession` turns away.
  *
  * Deliberately not `syncSharedSession`: that function is about keeping one
  * long-lived session aligned with pi's history, and every one of its paths reads
- * or writes `sharedSession`. A side request's history belongs to its caller, so it
+ * or writes `sharedSession`. Such a query's history belongs to its caller, so it
  * gets a session of its own, rebuilt per call and deleted when the query ends.
  */
 export function buildSideRequestSession(

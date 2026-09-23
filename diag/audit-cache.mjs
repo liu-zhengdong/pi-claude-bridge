@@ -29,7 +29,11 @@ const LINE = /^\[(\d{4}-\d{2}-\d{2}T[\d:.]+Z)\] \[([a-z0-9]+)\] (.*)$/;
 const USAGE = /^usage: in=(\d+) out=(\d+) cacheRead=(\d+) cacheWrite=(\d+) total=(\d+)(?: reasoning=\d+)? cachePct=(\d+)% model=(\S+)/;
 const FRESH = /^provider: fresh query model=(\S+) msgs=(\d+) tools=(\d+) resume=(\S+) effort=(\S+)/;
 const SYNC = /^syncResult: path=(\S+)/;
-const RESET = /^(session_start|session_compact|session_before_compact|compact summary|Case 1 synthetic)/;
+// `Case 1 synthetic` is the pre-#16 marker for a reentrant query's fresh session;
+// kept so older logs still read. Since #16 that query builds a throwaway session
+// (`side request: built session`), and a history rewritten outside
+// session_compact rebuilds (`Case 4 rewritten`).
+const RESET = /^(session_start|session_compact|session_before_compact|compact summary|Case 1 synthetic|Case 4 rewritten|side request: built session)/;
 
 // Claude Code's own detector (reference-code/claude-code-rip/src/services/api/
 // promptCacheBreakDetection.ts) ignores drops under 2000 tokens. Matching it keeps

@@ -31,7 +31,7 @@ import { makePromptStream, userMessage } from "./prompt-stream.js";
 import { QueryContext, ctx } from "./query-state.js";
 import { getAskClaudeToolName, getLongContextSettings, getPiSessionId, getProviderSettings } from "./runtime-config.js";
 import { adoptSession, clearSharedSession, getDeliveredToolResultCursor, getSharedSession, markNeedsRebuild, orphanedToolResultAction, recordToolResultDelivery, setCursor } from "./session-store.js";
-import { buildSideRequestSession, syncSharedSession, type SyncResult } from "./session-sync.js";
+import { buildSideRequestSession, ownsSharedSession, syncSharedSession, type SyncResult } from "./session-sync.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX } from "./skills.js";
 import { showStartupNoticeOnce } from "./startup-notice.js";
 import { claimCurrentPiStream, consumeQuery, deliverToolResults, drainForAbort, finalizeCurrentStream, markStreamComplete } from "./stream-events.js";
@@ -276,13 +276,17 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 	// --- Fresh query ---
 
-	// 1. Determine reentrancy. Reentrant queries get their own QueryContext so
-	//    background subagents can run concurrently with the parent query. A side
-	//    request is always its own: it runs alongside pi's conversation, so taking
-	//    the shared context would strand whatever that context is mid-turn.
-	const isReentrant = side || activeQuery;
+	// 1. Determine reentrancy. Only pi's own conversation takes the top-level
+	//    QueryContext and the shared session (ownsSharedSession). Everything else is
+	//    reentrant: it gets a QueryContext of its own, so background subagents run
+	//    concurrently with the parent query, and a throwaway session holding its own
+	//    history. A side request is always its own: it runs alongside pi's
+	//    conversation, so taking the shared context would strand whatever that
+	//    context is mid-turn.
+	const callSessionId = options?.sessionId;
+	const isReentrant = !ownsSharedSession({ side, activeQuery, sessionId: callSessionId }, getPiSessionId());
 	const queryCtx = isReentrant ? new QueryContext() : ctx();
-	debug(`provider: fresh query setup, isReentrant=${isReentrant}, activeContexts=${activeQueryContexts.size}`);
+	debug(`provider: fresh query setup, isReentrant=${isReentrant}, activeQuery=${activeQuery}, callSession=${callSessionId?.slice(0, 8) ?? "none"}, piSession=${getPiSessionId()?.slice(0, 8) ?? "none"}, activeContexts=${activeQueryContexts.size}`);
 
 	// Resolved first: an unaccountable system prompt throws, and doing that before
 	// anything is claimed or reset leaves no half-built query behind — in particular
@@ -320,15 +324,16 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// cliModel is the actual id sent to Claude Code (may carry [1m]); model.id is the
 	// pi-registered id. Log cliModel so debug lines reflect what CC actually received.
 	const cliModel = claudeCodeModelId(model, getLongContextSettings());
-	// A side request neither reads the shared session nor adopts one: its history is
-	// not pi's, so resuming pi's session would prepend a conversation the caller
-	// never sent. `preserveSharedSession` is what makes the completion handler treat
-	// the session Claude Code creates for it as ephemeral and delete it.
-	const sidePriorMessages = side ? context.messages.slice(0, turnStart(context.messages)) : [];
-	const syncResult: SyncResult = side
+	// A reentrant query neither reads the shared session nor adopts one: its history
+	// is not pi's, so resuming pi's session would prepend a conversation the caller
+	// never sent, and rewriting it would take the parent's session away mid-turn.
+	// `preserveSharedSession` is what makes the completion handler treat the session
+	// Claude Code creates for it as ephemeral and delete it.
+	const ownPriorMessages = isReentrant ? context.messages.slice(0, turnStart(context.messages)) : [];
+	const syncResult: SyncResult = isReentrant
 		? {
-			sessionId: sidePriorMessages.length > 0
-				? buildSideRequestSession(sidePriorMessages, cwd, customToolNameToSdk, cliModel)
+			sessionId: ownPriorMessages.length > 0
+				? buildSideRequestSession(ownPriorMessages, cwd, customToolNameToSdk, cliModel)
 				: null,
 			preserveSharedSession: true,
 		}
@@ -476,10 +481,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 			// --- Abort detection in normal completion path ---
 			if (wasAborted || options?.signal?.aborted) {
-				// A side request runs in its own Claude Code session, so aborting it says
+				// A reentrant query runs in its own Claude Code session, so aborting it says
 				// nothing about whether pi's session still matches pi's history.
-				if (!side) markNeedsRebuild({ forceRotate: true });
-				debug(`provider: abort detected, sharedSession needsRebuild + forceRotate=${!side}`);
+				if (!isReentrant) markNeedsRebuild({ forceRotate: true });
+				debug(`provider: abort detected, sharedSession needsRebuild + forceRotate=${!isReentrant}`);
 				if (queryCtx.turnOutput) {
 					queryCtx.turnOutput.stopReason = "aborted";
 					queryCtx.turnOutput.errorMessage = "Operation aborted";
@@ -514,10 +519,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		})
 		.catch((error) => {
 			debug(`provider: query error, model=${cliModel}, aborted=${Boolean(options?.signal?.aborted)}, error=`, error);
-			// Not for a side request: it owns no part of the shared session, and
+			// Not for a reentrant query: it owns no part of the shared session, and
 			// discarding pi's on its behalf would cost the next real turn a full rebuild
 			// over a failure that had nothing to do with it.
-			if (!side) {
+			if (!isReentrant) {
 				if ((wasAborted || options?.signal?.aborted) && getSharedSession()) {
 					markNeedsRebuild({ forceRotate: true });
 				} else {
@@ -548,10 +553,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			// nothing will resume it. Clear the handle only if a later query
 			// hasn't already claimed the shared context.
 			promptStream.fail(new Error("query ended"));
-			// The session built for a side request is scoped to that request, however it
+			// The session built for a reentrant query is scoped to that query, however it
 			// ended. When Claude Code kept the id we resumed, the completion handler above
 			// has already deleted it and this is a no-op.
-			if (side && syncResult.sessionId) deleteSession(syncResult.sessionId, cwd, process.env.CLAUDE_CONFIG_DIR);
+			if (isReentrant && syncResult.sessionId) deleteSession(syncResult.sessionId, cwd, process.env.CLAUDE_CONFIG_DIR);
 			if (queryCtx.promptStream === promptStream) queryCtx.promptStream = null;
 			// A later query claiming this context sets activeQuery to its own handle;
 			// null means the .then/.catch above cleared ours and nothing replaced it.

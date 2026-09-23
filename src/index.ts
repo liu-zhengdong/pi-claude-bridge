@@ -21,7 +21,7 @@ import { createPromptRecorder, promptCaptures } from "./prompt-record.js";
 import { buildMcpServers, reportLeaks, streamProviderEntry, streamSideRequest } from "./provider.js";
 import { applyRuntimeConfig, getPiSessionId, setPiMode, setPiSessionId, setPiUI } from "./runtime-config.js";
 import { clearSharedSession, getSharedSession, markNeedsRebuild, orphanedToolResultAction, setSharedSession, type SessionState } from "./session-store.js";
-import { buildSideRequestSession, syncSharedSession } from "./session-sync.js";
+import { buildSideRequestSession, ownsSharedSession, syncSharedSession } from "./session-sync.js";
 import { queueStartupNotice } from "./startup-notice.js";
 import { consumeQuery, deliverToolResults, drainForAbort, finalizeCurrentStream } from "./stream-events.js";
 import { bindUsageAdapter, claimUsageAdapter, refreshClaudeUsage, releaseUsageAdapter, setUsageControlQueryForTest } from "./usage.js";
@@ -72,6 +72,7 @@ export const __test = {
 	setPiUI,
 	orphanedToolResultAction,
 	syncSharedSession,
+	ownsSharedSession,
 	buildSideRequestSession,
 	extractUserPromptBlocks,
 	consumeQuery,
