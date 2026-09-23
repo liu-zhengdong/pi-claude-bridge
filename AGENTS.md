@@ -6,6 +6,8 @@ Commit and push finished work to `origin` directly, without asking first.
 
 Do **not** interact with the public without explicit permission. For example, do not open PRs or comment on github issues unless I say so.
 
+This checkout has an `upstream` remote (schuettc), which `gh` picks as its default repo unless `gh repo set-default liu-zhengdong/pi-claude-bridge` has been run — a bare `gh issue create` or `gh pr create` then posts upstream, in public. Pass `--repo liu-zhengdong/pi-claude-bridge` (and `--base schuettc-publish` for PRs).
+
 ## Claims about how Claude Code behaves
 
 `~/.claude/projects/**` is **not** evidence of what CC does. The bridge writes into
