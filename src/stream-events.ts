@@ -412,7 +412,16 @@ export async function deliverToolResults(
 	results: McpResult[],
 	steer: ContentBlockParam[] | null,
 	contextLength: number,
+	/** Labelled messages the user did not send. They ride on the last tool result,
+	 *  where CC shows them as part of it rather than as something the user said. */
+	notes: string[] = [],
 ): Promise<void> {
+	if (notes.length > 0) {
+		const note = { type: "text" as const, text: notes.join("\n\n") };
+		const last = results[results.length - 1];
+		if (last) results = [...results.slice(0, -1), { ...last, content: [...last.content, note] }];
+		else steer = [...(steer ?? []), note];
+	}
 	if (steer) {
 		const text = steer.map((b) => (b.type === "text" ? b.text : "[image]")).join("\n");
 		if (!c.promptStream) {
