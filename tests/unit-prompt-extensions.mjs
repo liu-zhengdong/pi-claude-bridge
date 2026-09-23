@@ -4,8 +4,9 @@
  * Text other extensions add to the system prompt reaches Claude Code (issue #12).
  *
  * Pi Notes and billion-context-pi return `event.systemPrompt + "\n\n" + text` from
- * before_agent_start. The bridge used to forward only what pi's structured options
- * describe, so that text sat in the capture key and never reached the projection.
+ * before_agent_start, which pi 0.87 carries as `forceSystemPrompt`. The bridge used
+ * to forward only what pi's structured options describe, so that text sat in the
+ * capture key and never reached the projection.
  * Prompts here are rendered with pi's own builder: if pi changes how it lays out
  * its sections, these fail instead of the text silently going missing again.
  */
@@ -37,6 +38,9 @@ function options(overrides = {}) {
 
 // What Pi Notes and billion-context-pi do from before_agent_start.
 const append = (prompt, text) => `${prompt}\n\n${text}`;
+
+// The options a later handler sees once an earlier one returned `prompt`.
+const forced = (opts, prompt) => ({ ...opts, forceSystemPrompt: prompt });
 
 function activateWithMockPi() {
 	const handlers = new Map();
@@ -107,8 +111,10 @@ describe("extensionAdditions", () => {
 		assert.match(result.problem, /ahead of pi's assembly/);
 	});
 
-	it("leaves a forced prompt alone", () => {
-		assert.deepEqual(extensionAdditions("forced", options({ forceSystemPrompt: "forced" })), {});
+	it("reads the additions out of the forced prompt pi carries them in", () => {
+		const opts = options();
+		const prompt = append(buildSystemPrompt(opts), NOTES);
+		assert.deepEqual(extensionAdditions(prompt, forced(opts, prompt)), { text: NOTES });
 	});
 });
 
@@ -117,7 +123,7 @@ describe("before_agent_start forwards extension text", () => {
 		const handlers = activateWithMockPi();
 		const opts = options();
 		const prompt = append(append(buildSystemPrompt(opts), NOTES), ACP);
-		handlers.get("before_agent_start")({ systemPrompt: prompt, systemPromptOptions: opts }, {});
+		handlers.get("before_agent_start")({ systemPrompt: prompt, systemPromptOptions: forced(opts, prompt) }, {});
 
 		const projected = projectPromptCapture(__test.promptCaptures.resolveOrDerive(prompt), { skillReadTool: "mcp" });
 		assert.ok(projected.includes("global rules"), "context files still forwarded");
@@ -130,7 +136,8 @@ describe("before_agent_start forwards extension text", () => {
 		const notices = [];
 		const ctx = { ui: { notify: (message, level) => notices.push({ message, level }) } };
 		for (const turn of [1, 2]) {
-			handlers.get("before_agent_start")({ systemPrompt: `rebuilt prompt, turn ${turn}`, systemPromptOptions: options() }, ctx);
+			const prompt = `rebuilt prompt, turn ${turn}`;
+			handlers.get("before_agent_start")({ systemPrompt: prompt, systemPromptOptions: forced(options(), prompt) }, ctx);
 		}
 		assert.equal(notices.length, 1);
 		assert.equal(notices[0].level, "warning");

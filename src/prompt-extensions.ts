@@ -5,13 +5,13 @@
 // `systemPrompt: event.systemPrompt + "\n\n" + text` from before_agent_start
 // leaves no trace in those options, only in the rendered string — Pi Notes
 // appends the user's default-open notes that way, billion-context-pi its tool
-// guide. Pi renders its own sections first, `<cwd>` last among them, then any
-// custom sections new to its map, joining all of them with a blank line. So
-// whatever follows is the extensions'.
+// guide. Pi carries such a return as `forceSystemPrompt`, and it is still pi's
+// rendering with their text after it: pi renders its own sections first, `<cwd>`
+// last among them, then any custom sections new to its map, joining all of them
+// with a blank line. So whatever follows is the extensions'.
 
 export type AssemblyOptions = {
 	customPrompt?: string;
-	forceSystemPrompt?: string;
 	cwd?: string;
 	sections?: Record<string, string>;
 };
@@ -28,8 +28,7 @@ function renderSection(name: string, content: string): string {
 }
 
 export function extensionAdditions(prompt: string, options: AssemblyOptions | undefined): ExtensionAdditions {
-	// A forced prompt is opaque: pi renders no sections, so there is nothing to anchor on.
-	if (!options || options.forceSystemPrompt !== undefined) return {};
+	if (!options) return {};
 
 	// A custom section named `cwd` replaces pi's content in place.
 	const cwd = options.sections?.cwd || options.cwd?.replace(/\\/g, "/");

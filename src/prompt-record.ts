@@ -59,9 +59,11 @@ type SystemPromptOptions = AssemblyOptions & {
  *  module, and a subagent's run must not leave its own options behind for the
  *  parent's next recording. */
 export function createPromptRecorder() {
-	// The options (custom/append/contextFiles/skills) are pi config, stable across a
-	// turn; only the auto-generated tool list in the rendered prompt varies. Stashed
-	// at before_agent_start so the later recordings can reuse them.
+	// The options (custom/append/contextFiles/skills, and the cwd and sections that
+	// locate extension text) are pi config, stable across a turn; only the
+	// auto-generated tool list in the rendered prompt varies. Stashed at
+	// before_agent_start so the later recordings can reuse them — by agent_start,
+	// ctx.getSystemPromptOptions() no longer carries cwd.
 	let lastOptions: SystemPromptOptions | undefined;
 	// Each problem is dumped once per activation; recording repeats every turn and tool call.
 	const diagnosed = new Set<string>();
