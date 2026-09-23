@@ -1,7 +1,8 @@
 // 调试与诊断日志。
 //
 // CLAUDE_BRIDGE_DEBUG=1 把调试日志写到 ~/.pi/agent/claude-bridge.log。
-// 诊断转储（diagDump）无条件写 claude-bridge-diag.log，只用于「不该发生」的路径。
+// 诊断转储（diagDump）无条件写 claude-bridge-diag.log，只用于「不该发生」的路径；
+// CLAUDE_BRIDGE_DIAG_PATH 可改写位置，单元测试靠它不碰真实日志。
 
 import { appendFileSync, mkdirSync } from "fs";
 import { homedir } from "os";
@@ -9,7 +10,7 @@ import { dirname, join } from "path";
 
 export const DEBUG = process.env.CLAUDE_BRIDGE_DEBUG === "1";
 export const DEBUG_LOG_PATH = process.env.CLAUDE_BRIDGE_DEBUG_PATH || join(homedir(), ".pi", "agent", "claude-bridge.log");
-export const DIAG_LOG_PATH = join(homedir(), ".pi", "agent", "claude-bridge-diag.log");
+export const DIAG_LOG_PATH = process.env.CLAUDE_BRIDGE_DIAG_PATH || join(homedir(), ".pi", "agent", "claude-bridge-diag.log");
 
 // CLAUDE_BRIDGE_RECORD_STREAM=<path> appends every SDK message consumeQuery sees,
 // one JSON object per line. Used by tests/lib/record-sdk-streams.mjs to capture

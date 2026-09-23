@@ -153,8 +153,16 @@ export default function (pi: ExtensionAPI) {
 	//
 	// Why all three events, and why the recorder is per activation: prompt-record.js.
 	const promptRecorder = createPromptRecorder();
-	pi.on("before_agent_start", (event) => {
-		promptRecorder.recordAssembled(event.systemPrompt, event.systemPromptOptions);
+	let warnedUnforwarded = false;
+	pi.on("before_agent_start", (event, ctx) => {
+		const problem = promptRecorder.recordAssembled(event.systemPrompt, event.systemPromptOptions);
+		if (problem && !warnedUnforwarded) {
+			warnedUnforwarded = true;
+			ctx?.ui?.notify?.(
+				`claude-bridge: ${problem}; Claude Code will not see that part of the system prompt. Details in claude-bridge-diag.log.`,
+				"warning",
+			);
+		}
 	});
 	pi.on("agent_start", (_event, ctx) => {
 		promptRecorder.recordWidened(ctx.getSystemPrompt());

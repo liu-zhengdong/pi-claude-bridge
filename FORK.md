@@ -34,6 +34,7 @@ git log --oneline HEAD..upstream/schuettc-publish
 ## 本 fork 的改动
 
 - **#1 / PR #2**：自动重试工具结果续接时，不再被当成孤儿工具结果返回空回复。Pi 的 auto-retry 重发「工具结果之后的模型调用」时，原来会命中为「用户按 ESC 打断工具调用」设计的分支，返回零 token 空消息，Pi 判定重试成功后轮次结束、会话停住。现在按「这条工具结果有没有被交付过」区分，重发的落到 fresh-query 路径继续。
+- **#12**：其他扩展追加到系统提示的文本（Pi Notes 的默认展开笔记、billion-context-pi 的使用说明）现在会转给 Claude Code。原来只转发 Pi 结构化选项里的 custom / append / 上下文文件 / 技能，追加文本在查找 key 里、不在投影里，每轮都被静默丢掉。现在定位 Pi 自身组装的结尾（`<cwd>` 段及其后新增的自定义段），把之后的内容接在 append 后面；定位不到时写 diag 并提示一次。
 
 ## 测试
 
