@@ -5,14 +5,14 @@
 // conversation) run through the same functions without seeing each other's
 // turn state. provider.js owns the contexts; this module only drives them.
 
-import { query, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import { query, type SDKMessage, type SDKModelRefusalFallbackMessage, type SDKModelRefusalNoFallbackMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import type { AssistantMessageEventStream, Model } from "@earendil-works/pi-ai";
 import { appendFileSync } from "fs";
 import { RECORD_STREAM_PATH, debug } from "./debug.js";
 import { describeRateLimitFailure, resultErrorText } from "./errors.js";
 import type { McpResult } from "./extract-tool-results.js";
-import { mapStopReason, mapToolArgs, parsePartialJson, piToolNameFor } from "./mapping.js";
+import { mapStopReason, mapToolArgs, parsePartialJson, piToolNameFor, servedModelId } from "./mapping.js";
 import { userMessage, type PromptStream } from "./prompt-stream.js";
 import { QueryContext } from "./query-state.js";
 import { getPiUI } from "./runtime-config.js";
@@ -72,6 +72,22 @@ export function finalizeCurrentStream(c: QueryContext, stopReason?: string): voi
 	c.currentPiStream = null;
 }
 
+/** Takes the current API message's blocks back out of the pi turn.
+ *
+ *  Claude Code retries a refused API message on its fallback model, and a failed
+ *  one as is, and deletes the partial from its own transcript. Left in pi's turn,
+ *  the partial sits ahead of the reply in pi's history, and the next rebuild sends
+ *  Claude Code content it deleted. A refused tool call is the worst case: ending
+ *  the turn on it would have pi run a call Claude Code withdrew. */
+function dropLeg(c: QueryContext, reason: "refused" | "unfinished"): void {
+	const dropped = c.turnBlocks.splice(c.legStart);
+	c.turnSawToolCall = c.turnBlocks.some((b: any) => b.type === "toolCall");
+	c.turnToolCallIds = c.turnToolCallIds.filter((id) => c.turnBlocks.some((b: any) => b.type === "toolCall" && b.id === id));
+	c.legOpen = false;
+	c.legRefused = false;
+	debug(`processStreamEvent: dropped a ${reason} API message, ${dropped.length} block(s): ${dropped.map((b: any) => b.type).join(",") || "none"}`);
+}
+
 /** Maps Anthropic stream events to pi stream events (text, thinking, toolcall).
  *  On message_stop with tool_use: ends currentPiStream so pi can execute the tool. */
 function processStreamEvent(
@@ -85,7 +101,14 @@ function processStreamEvent(
 	const event = (message as SDKMessage & { event: any }).event;
 
 	if (event?.type === "message_start") {
+		// A new API message while the last one never reached message_stop: Claude Code
+		// gave up on that one and is retrying.
+		if (c.legOpen) dropLeg(c, c.legRefused ? "refused" : "unfinished");
+		c.legStart = c.turnBlocks.length;
+		c.legOpen = true;
 		c.turnToolCallIds = [];
+		const served = event.message?.model;
+		if (typeof served === "string") c.turnOutput.model = servedModelId(served, model.id);
 		if (event.message?.usage) updateUsage(c.turnOutput, event.message.usage, model);
 		return;
 	}
@@ -162,8 +185,21 @@ function processStreamEvent(
 	}
 
 	if (event?.type === "message_delta") {
-		c.turnOutput.stopReason = mapStopReason(event.delta?.stop_reason);
+		if (event.delta?.stop_reason === "refusal") {
+			c.legRefused = true;
+		} else {
+			c.turnOutput.stopReason = mapStopReason(event.delta?.stop_reason);
+		}
 		if (event.usage) updateUsage(c.turnOutput, event.usage, model);
+		return;
+	}
+
+	if (event?.type === "message_stop") c.legOpen = false;
+
+	// A refused message is not the reply. What follows is Claude Code's retry on its
+	// fallback model, or the failure result when it has none.
+	if (event?.type === "message_stop" && c.legRefused) {
+		dropLeg(c, "refused");
 		return;
 	}
 
@@ -199,6 +235,11 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
 	if (c.turnSawStreamEvent) return;
 	const assistantMsg = (message as any).message;
 	if (!assistantMsg?.content) return;
+	// Same reasoning as dropLeg: a refused message is retried, not the reply.
+	if (assistantMsg.stop_reason === "refusal") {
+		debug(`processAssistantMessage: skipping a refused API message, ${assistantMsg.content.length} block(s)`);
+		return;
+	}
 	c.turnToolCallIds = [];
 	debug(`processAssistantMessage fallback: ${assistantMsg.content.length} blocks, types=${assistantMsg.content.map((b: any) => b.type).join(",")}`);
 	for (const block of assistantMsg.content) {
@@ -336,6 +377,13 @@ export async function consumeQuery(
 			if (listeners === 0) notifyIfStandalone(event);
 			continue;
 		}
+		// Arrives at the end of the turn, after the retry's own blocks — usually after
+		// a tool call has already ended the pi stream — so it cannot share the gate
+		// below either.
+		if (message.type === "system" && isRefusalNotice(message)) {
+			reportRefusal(message);
+			continue;
+		}
 		if (!queryCtx.currentPiStream || !queryCtx.turnOutput) continue;
 
 		switch (message.type) {
@@ -383,6 +431,39 @@ export async function consumeQuery(
 	debug(`consumeQuery: for-await loop exited, wasAborted=${wasAborted()}, capturedSessionId=${capturedSessionId?.slice(0, 8) ?? "none"}`);
 
 	return { capturedSessionId };
+}
+
+type RefusalNotice = SDKModelRefusalFallbackMessage | SDKModelRefusalNoFallbackMessage;
+
+function isRefusalNotice(message: SDKMessage): message is RefusalNotice {
+	const subtype = (message as { subtype?: string }).subtype;
+	return subtype === "model_refusal_fallback" || subtype === "model_refusal_no_fallback";
+}
+
+// Claude Code session ids already told about their fallback model.
+const reportedFallbacks = new Set<string>();
+
+/** Claude Code refused the model's reply. With a fallback model it retries on
+ *  that one, for the rest of its session when `scope` is "session", and reports it
+ *  here. The refused partial is already out of the pi turn (dropLeg), and each
+ *  message records the model that served it; what is left is telling the user,
+ *  whose model picker still shows the model they chose. Once per session: every
+ *  later turn runs on the fallback too, and repeating it would say nothing new. */
+function reportRefusal(notice: RefusalNotice): void {
+	const category = notice.api_refusal_category ?? "unknown";
+	if (notice.subtype === "model_refusal_no_fallback") {
+		debug(`consumeQuery: model_refusal_no_fallback original=${notice.original_model} category=${category}`);
+		return;
+	}
+	const scope = notice.scope ?? "session";
+	debug(`consumeQuery: model_refusal_fallback ${notice.original_model} -> ${notice.fallback_model} scope=${scope} category=${category} retracted=${notice.retracted_message_uuids?.length ?? 0}`);
+	if (scope !== "session" || reportedFallbacks.has(notice.session_id)) return;
+	reportedFallbacks.add(notice.session_id);
+	const original = notice.original_model.replace(/\[1m\]$/, "");
+	getPiUI()?.notify(
+		`Claude Code 的 safeguards 拦下了 ${original} 的回复（${category}），本会话已换成 ${notice.fallback_model}。新开会话（/new）可回到 ${original}。`,
+		"warning",
+	);
 }
 
 /** A steer that never made it into CC's session. The cursor has already counted

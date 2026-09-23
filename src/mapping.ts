@@ -65,6 +65,16 @@ export function mapStopReason(reason: string | undefined): "stop" | "length" | "
 	}
 }
 
+/** The model id to record on pi's message, given the one an API message says
+ *  served it. Pi's own id unless Claude Code served a different model; a dated
+ *  snapshot of pi's id (`claude-haiku-4-5-20251001`) is still pi's model. This is
+ *  for a refusal fallback, where Claude Code swaps the session to another model
+ *  (Opus 5.5 to Opus 5) and pi would otherwise record the model it asked for. */
+export function servedModelId(served: string, requested: string): string {
+	const dated = served.startsWith(`${requested}-`) && /^\d{8}$/.test(served.slice(requested.length + 1));
+	return served === requested || dated ? requested : served;
+}
+
 export function parsePartialJson(input: string, fallback: Record<string, unknown>): Record<string, unknown> {
 	if (!input) return fallback;
 	try { return JSON.parse(input); } catch { return fallback; }
