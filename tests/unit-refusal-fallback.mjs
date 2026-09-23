@@ -13,6 +13,7 @@
  */
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { existsSync, readFileSync } from "node:fs";
 import { QueryContext } from "../src/query-state.js";
 import { servedModelId } from "../src/mapping.js";
 
@@ -81,6 +82,13 @@ describe("a refused API message retried on the fallback model", () => {
 		assert.equal(c.turnOutput.content[0].thinking, "retry thinking");
 		assert.equal(c.turnOutput.model, "claude-opus-5", "pi must record the model that answered, not the one it asked for");
 		assert.equal(c.turnOutput.stopReason, "stop");
+
+		// The next real refusal is the only check on this stream shape, so it must
+		// leave a record without CLAUDE_BRIDGE_DEBUG — and not the refused text.
+		const diagPath = process.env.CLAUDE_BRIDGE_DIAG_PATH;
+		const diag = existsSync(diagPath) ? readFileSync(diagPath, "utf8") : "";
+		assert.match(diag, /"label":"refused_api_message"[^\n]*"blocks":"thinking"/);
+		assert.doesNotMatch(diag, /refused partial/);
 	});
 
 	it("never ends the pi turn on a tool call Claude Code withdrew", async () => {

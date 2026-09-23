@@ -9,7 +9,7 @@ import { query, type SDKMessage, type SDKModelRefusalFallbackMessage, type SDKMo
 import type { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import type { AssistantMessageEventStream, Model } from "@earendil-works/pi-ai";
 import { appendFileSync } from "fs";
-import { RECORD_STREAM_PATH, debug } from "./debug.js";
+import { RECORD_STREAM_PATH, debug, diagDump } from "./debug.js";
 import { describeRateLimitFailure, resultErrorText } from "./errors.js";
 import type { McpResult } from "./extract-tool-results.js";
 import { mapStopReason, mapToolArgs, parsePartialJson, piToolNameFor, servedModelId } from "./mapping.js";
@@ -85,7 +85,12 @@ function dropLeg(c: QueryContext, reason: "refused" | "unfinished"): void {
 	c.turnToolCallIds = c.turnToolCallIds.filter((id) => c.turnBlocks.some((b: any) => b.type === "toolCall" && b.id === id));
 	c.legOpen = false;
 	c.legRefused = false;
-	debug(`processStreamEvent: dropped a ${reason} API message, ${dropped.length} block(s): ${dropped.map((b: any) => b.type).join(",") || "none"}`);
+	const types = dropped.map((b: any) => b.type).join(",") || "none";
+	debug(`processStreamEvent: dropped a ${reason} API message, ${dropped.length} block(s): ${types}`);
+	// A refusal cannot be produced on demand, so the only check that this stream
+	// shape is what Claude Code sends is the next real one. Written even without
+	// CLAUDE_BRIDGE_DEBUG; block types only, never their text.
+	if (reason === "refused") diagDump("refused_api_message", { model: c.turnOutput?.model, blocks: types });
 }
 
 /** Maps Anthropic stream events to pi stream events (text, thinking, toolcall).
@@ -453,10 +458,12 @@ function reportRefusal(notice: RefusalNotice): void {
 	const category = notice.api_refusal_category ?? "unknown";
 	if (notice.subtype === "model_refusal_no_fallback") {
 		debug(`consumeQuery: model_refusal_no_fallback original=${notice.original_model} category=${category}`);
+		diagDump("model_refusal_no_fallback", { original: notice.original_model, category, session: notice.session_id });
 		return;
 	}
 	const scope = notice.scope ?? "session";
 	debug(`consumeQuery: model_refusal_fallback ${notice.original_model} -> ${notice.fallback_model} scope=${scope} category=${category} retracted=${notice.retracted_message_uuids?.length ?? 0}`);
+	diagDump("model_refusal_fallback", { original: notice.original_model, fallback: notice.fallback_model, scope, category, retracted: notice.retracted_message_uuids?.length ?? 0, session: notice.session_id });
 	if (scope !== "session" || reportedFallbacks.has(notice.session_id)) return;
 	reportedFallbacks.add(notice.session_id);
 	const original = notice.original_model.replace(/\[1m\]$/, "");
