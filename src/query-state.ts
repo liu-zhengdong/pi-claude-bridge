@@ -37,6 +37,14 @@ export class QueryContext {
 	turnStarted = false;
 	turnSawStreamEvent = false;
 	turnSawToolCall = false;
+	/** Where the current API message's blocks start in `turnBlocks`. One pi turn can
+	 *  stream several API messages: Claude Code retries a refused one on its fallback
+	 *  model, and a failed one as is. Only what follows the last is the reply. */
+	legStart = 0;
+	/** An API message has started and not reached message_stop. */
+	legOpen = false;
+	/** The current API message ended with stop_reason "refusal". */
+	legRefused = false;
 
 	get turnBlocks(): Array<any> {
 		if (!this.turnOutput) throw new Error("turnBlocks accessed before resetTurnState");
@@ -65,6 +73,9 @@ export class QueryContext {
 		this.turnStarted = false;
 		this.turnSawStreamEvent = false;
 		this.turnSawToolCall = false;
+		this.legStart = 0;
+		this.legOpen = false;
+		this.legRefused = false;
 		// turnToolCallIds is NOT reset — it persists across tool-result delivery
 		// callbacks within the same assistant message so results can be routed to
 		// this query while its handlers are still pending.
