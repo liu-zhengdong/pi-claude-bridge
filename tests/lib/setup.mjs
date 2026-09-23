@@ -24,5 +24,8 @@ import { join } from "node:path";
 
 const logDir = mkdtempSync(join(tmpdir(), "claude-bridge-test-log-"));
 process.env.CLAUDE_BRIDGE_DEBUG_PATH = join(logDir, "claude-bridge.log");
+// diagDump writes unconditionally, so a test that reaches a diagnosed path would
+// otherwise append fixtures to the real ~/.pi/agent/claude-bridge-diag.log.
+process.env.CLAUDE_BRIDGE_DIAG_PATH = join(logDir, "claude-bridge-diag.log");
 process.env.CLAUDE_BRIDGE_MODELS_CACHE = join(logDir, "claude-bridge-models.json");
 process.on("exit", () => rmSync(logDir, { recursive: true, force: true }));

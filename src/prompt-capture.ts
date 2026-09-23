@@ -10,6 +10,8 @@ export type PromptCaptureInput = {
 	append?: string;
 	contextFiles: { path: string; content: string }[];
 	skills: Skill[];
+	/** What other extensions added to pi's assembly; see prompt-extensions.ts. */
+	extensions?: string;
 };
 
 type InheritedPrompt = {
@@ -82,6 +84,7 @@ export class PromptCaptures {
 
 		capture.custom = input.custom;
 		capture.append = input.append;
+		capture.extensions = input.extensions;
 		capture.contextFiles = input.contextFiles.map((file) => ({ ...file }));
 		capture.skills = [...input.skills];
 		if (!existing || customChanged) {
@@ -290,6 +293,7 @@ function projectCapture(
 			renderSkillsBlock(ownSkills, options.skillReadTool),
 			custom,
 			capture.append,
+			capture.extensions,
 		].filter((part): part is string => Boolean(part));
 		return parts.length > 0 ? parts.join("\n\n") : undefined;
 	} finally {
