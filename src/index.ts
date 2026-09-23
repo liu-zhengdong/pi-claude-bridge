@@ -6,7 +6,7 @@
 // compact and branch-summary takeovers, askclaude.js for the tool.
 
 import { getApiProvider, registerApiProvider, unregisterApiProviders } from "@earendil-works/pi-ai/compat";
-import { compact, generateBranchSummary, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { buildSessionContext, compact, generateBranchSummary, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerAskClaudeTool } from "./askclaude.js";
 import { CC_CHILD_ENV, childEnv } from "./cc-child.js";
 import { loadConfig } from "./config.js";
@@ -14,6 +14,7 @@ import { PROVIDER_ID } from "./convert.js";
 import { debug, moduleInstanceId } from "./debug.js";
 import { errorMessage, resultErrorText } from "./errors.js";
 import { branchSummaryOutcome, isolatedStreamFn, reinjectPriorCompactionFileOps } from "./isolated-summary.js";
+import { messageOrigins, observeBranchTail } from "./message-origin.js";
 import { createModelCatalogRefresher, readDiscoveredModelIds } from "./model-discovery.js";
 import { extractUserPromptBlocks } from "./pi-context.js";
 import { createPromptRecorder, promptCaptures } from "./prompt-record.js";
@@ -128,6 +129,10 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", (event, ctx) => {
 		setPiUI(ctx.ui);
 		setPiMode(ctx.mode);
+		// Input still waiting at the end of a resumed branch fired its message_end in
+		// an earlier process; see message-origin.ts.
+		const branch = ctx.sessionManager?.getBranch?.();
+		if (branch) observeBranchTail(messageOrigins, buildSessionContext(branch).messages);
 		// The factory that registered the singleton adapter owns its session state.
 		// Later in-process child factories share this module but cannot rebind it.
 		if (usageAdapter) {
@@ -152,6 +157,11 @@ export default function (pi: ExtensionAPI) {
 	// still depends on, so both flags are forwarded as an append.
 	//
 	// Why all three events, and why the recorder is per activation: prompt-record.js.
+	// Which user-role messages the user sent, for provider.ts to tell them from
+	// extension messages; see message-origin.ts.
+	pi.on("message_end", (event) => {
+		messageOrigins.observe(event.message);
+	});
 	const promptRecorder = createPromptRecorder();
 	let warnedUnforwarded = false;
 	pi.on("before_agent_start", (event, ctx) => {

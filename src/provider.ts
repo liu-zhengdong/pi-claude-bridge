@@ -23,6 +23,7 @@ import type { McpResult } from "./extract-tool-results.js";
 import { createToolServer } from "./mcp-server.js";
 import { claudeCodeModelId } from "./models.js";
 import { newAssistantMessageEventStream } from "./pi-ai-compat.js";
+import { labelUserTurn, messageOrigins, splitUserTurn } from "./message-origin.js";
 import { adaptContext, extractAllToolResults, extractUserPrompt, extractUserPromptBlocks, steerBlocks, turnStart } from "./pi-context.js";
 import { projectPromptCapture } from "./prompt-capture.js";
 import { promptCaptures } from "./prompt-record.js";
@@ -220,12 +221,19 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		resultCtx.resetTurnState(model);
 		// User messages (steer/followUp) pi injected into context during the
 		// active query: a steer sent while a tool was executing, drained by pi at
-		// the turn boundary and appended alongside the tool result.
-		const steer = lastMsgRole === "user" ? steerBlocks(context.messages) : null;
+		// the turn boundary and appended alongside the tool result. Only what the
+		// user sent goes in as a steer, which CC presents as the user's words; an
+		// extension's message rides on the tool result instead, labelled (see
+		// message-origin.ts). A side request's messages never passed through pi's
+		// message events, so they keep the plain steer.
+		const turn = lastMsgRole !== "user" ? undefined
+			: side ? { fromUser: context.messages, notes: [] }
+			: splitUserTurn(context.messages, messageOrigins);
+		const steer = turn && turn.fromUser.length > 0 ? steerBlocks(turn.fromUser) : null;
 		// Delivery is async because the steer must reach CC's stdin *before* the
 		// tool result does — see deliverToolResults. Detached so the provider
 		// still returns its stream synchronously.
-		void deliverToolResults(resultCtx, allResults, steer, context.messages.length);
+		void deliverToolResults(resultCtx, allResults, steer, context.messages.length, turn?.notes ?? []);
 		// The shared cursor tracks the top-level conversation. A reentrant subagent
 		// delivering its own results would drag it to that subagent's message count
 		// — observed pulling a parent from 5 back to 3, which cost the parent's next
@@ -326,8 +334,11 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		}
 		: syncSharedSession(context.messages, cwd, customToolNameToSdk, cliModel);
 	const { sessionId: resumeSessionId } = syncResult;
-	const promptBlocks = extractUserPromptBlocks(context.messages);
-	let promptText = extractUserPrompt(context.messages) ?? "";
+	// Labels what the user did not send (message-origin.ts). History above went to
+	// syncSharedSession unchanged; a side request's prompt is its caller's own.
+	const promptMessages = side ? context.messages : labelUserTurn(context.messages, messageOrigins);
+	const promptBlocks = extractUserPromptBlocks(promptMessages);
+	let promptText = extractUserPrompt(promptMessages) ?? "";
 
 	// Guard: empty prompt means the last context message isn't a user message.
 	// This should never happen with per-query state — dump diagnostics if it does.

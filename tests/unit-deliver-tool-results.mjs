@@ -75,6 +75,32 @@ describe("deliverToolResults", () => {
 		assert.deepStrictEqual(sent[0].message.content, steerText);
 	});
 
+	it("attaches notes to the last tool result, keeping them out of the steer", async () => {
+		const sent = [];
+		const resolved = new Map();
+		const c = new QueryContext();
+		c.promptStream = { push: (msg) => { sent.push(msg); return Promise.resolve(); } };
+		c.pendingToolCalls.set("call-1", { toolName: "read", resolve: (r) => resolved.set("call-1", r) });
+		c.pendingToolCalls.set("call-2", { toolName: "bash", resolve: (r) => resolved.set("call-2", r) });
+		const note = "<system-reminder>\nAdded by pi or one of its extensions, not typed by the user:\ncompress early\n</system-reminder>";
+
+		await __test.deliverToolResults(c, [result("call-1"), result("call-2")], steerText, 4, [note]);
+
+		assert.deepStrictEqual(sent.map((msg) => msg.message.content), [steerText], "the steer carries only the user's words");
+		assert.deepStrictEqual(resolved.get("call-1").content, [{ type: "text", text: "ok" }]);
+		assert.deepStrictEqual(resolved.get("call-2").content, [{ type: "text", text: "ok" }, { type: "text", text: note }]);
+	});
+
+	it("sends notes with the steer when no tool result can carry them", async () => {
+		const sent = [];
+		const c = new QueryContext();
+		c.promptStream = { push: (msg) => { sent.push(msg); return Promise.resolve(); } };
+
+		await __test.deliverToolResults(c, [], null, 4, ["labelled note"]);
+
+		assert.deepStrictEqual(sent[0].message.content, [{ type: "text", text: "labelled note" }]);
+	});
+
 	it("keeps image blocks in the steer", async () => {
 		const sent = [];
 		const c = new QueryContext();
