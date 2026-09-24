@@ -224,28 +224,33 @@ test("result.modelUsage reports the served context window", { timeout: 120_000 }
 
 // --- Streaming ---
 
-test("resuming an imported tool result continues the interrupted turn without a second user prompt", { timeout: 120_000 }, async () => {
-	// The mid-turn history handover rebuilds a CC session ending at a tool result.
-	// If CC stops treating these env vars as an interrupted-turn continuation,
-	// it may insert "No response requested." and close without answering.
+test("a streamed continuation prompt resumes an imported tool result with the MCP tools available", { timeout: 120_000 }, async () => {
+	// The mid-turn history handover (and an orphan resume) rebuilds a CC session
+	// ending at a tool result and opens the query with a continuation prompt on the
+	// prompt stream. The turn must go on to call further tools, so the tools have to
+	// be registered by the time that prompt reaches the model. They were not with
+	// CLAUDE_CODE_RESUME_INTERRUPTED_TURN, which re-runs the turn during CC's
+	// startup, before the SDK connects in-process MCP servers (issue #23).
 	const cwd = mkdtempSync(join(tmpdir(), "cc-resume-contract-"));
 	const session = createSession({ projectPath: cwd, model: MODEL });
 	const toolUseId = "toolu_01ResumeContract000000001";
 	session.importMessages([
-		{ role: "user", content: "Compute 6*7 with the calc tool, then reply with RESULT:42." },
-		{ role: "assistant", content: [{ type: "tool_use", id: toolUseId, name: "mcp__custom-tools__calc", input: { expr: "6*7" } }] },
-		{ role: "user", content: [{ type: "tool_result", tool_use_id: toolUseId, content: "42" }] },
+		{ role: "user", content: "Call the alpha tool, then the beta tool, one at a time. Then reply with both values." },
+		{ role: "assistant", content: [{ type: "tool_use", id: toolUseId, name: "mcp__custom-tools__alpha", input: {} }] },
+		{ role: "user", content: [{ type: "tool_result", tool_use_id: toolUseId, content: "alpha-VALUE" }] },
 	]);
 	session.save();
 	let release;
 	const held = new Promise((resolve) => { release = resolve; });
-	async function* parkedPrompt() { await held; }
+	async function* continuation() {
+		const content = "<system-reminder>\nThe previous query stopped after a tool result. Continue the current task from the tool results above.\n</system-reminder>";
+		yield { type: "user", message: { role: "user", content }, parent_tool_use_id: null };
+		await held;
+	}
+	const calls = [];
 	const q = query({
-		prompt: parkedPrompt(),
-		options: providerOptions({
-			cwd, resume: session.sessionId,
-			env: { ...process.env, CLAUDE_CODE_RESUME_INTERRUPTED_TURN: "1", CLAUDE_CODE_RESUME_PROMPT: "Continue the current task from the tool result above." },
-		}),
+		prompt: continuation(),
+		options: providerOptions({ cwd, resume: session.sessionId, mcpServers: toolServer([noArgTool("alpha"), noArgTool("beta")], calls) }),
 	});
 	const texts = [];
 	let result = null;
@@ -255,7 +260,8 @@ test("resuming an imported tool result continues the interrupted turn without a 
 			if (message.type === "result") { result = message; break; }
 		}
 		assert.ok(result && !result.is_error, `no successful continuation result: ${JSON.stringify(result)}`);
-		assert.match(texts.join(" "), /RESULT:\s*42/, `CC did not answer from the imported tool result: ${JSON.stringify(texts)}`);
+		assert.deepEqual(calls.map((c) => c.name), ["beta"], `the resumed turn did not go on to call beta: ${JSON.stringify(texts)}`);
+		assert.match(texts.join(" "), /beta-VALUE/, `CC did not answer from the new tool result: ${JSON.stringify(texts)}`);
 	} finally {
 		release();
 		q.close();
