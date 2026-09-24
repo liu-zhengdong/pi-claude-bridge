@@ -59,8 +59,9 @@ export function reportLeaks(label: string): void {
 }
 
 
-/** Claude Code's recovery prompt when we rebuild from a tool result. This is
- *  injected as a meta prompt at resume, not sent as a new user turn. */
+/** Opens a query that resumes a session ending at a tool result (a handover or an
+ *  orphan resume). Sent through the prompt stream like any turn's prompt, and
+ *  labelled so the model does not read it as the user's (issue #23). */
 const CONTINUATION_PROMPT = extensionNote(
 	"The previous query stopped after a tool result. Continue the current task from the tool results above.",
 );
@@ -390,8 +391,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			sharedSession: (() => { const s = getSharedSession(); return s ? { sessionId: s.sessionId.slice(0, 8), cursor: s.cursor } : null; })(),
 			messageRoles: context.messages.map((m, i) => `[${i}]${m.role}`).join(" "),
 		});
-		// Only a genuine orphan with no prior delivery needs the fallback prompt.
-		// Resuming a tool result is handled by Claude Code's interrupted-turn path.
+		// Resuming a tool result opens with CONTINUATION_PROMPT below; only a genuine
+		// orphan with no prior delivery needs the fallback.
 		if (orphanAction !== "resume" && !handover) promptText = "[continue]";
 	}
 
@@ -401,11 +402,17 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// first result — consumeQuery ends the stream explicitly instead, or the
 	// query would never terminate.
 	const promptStream = makePromptStream();
+	//
+	// A resumed tool result opens the same way, with CONTINUATION_PROMPT. Not with
+	// CLAUDE_CODE_RESUME_INTERRUPTED_TURN: Claude Code re-runs the interrupted turn
+	// during startup, before the SDK has registered our in-process MCP server, so
+	// that request carries no tools and the model can only end the turn (issue #23).
 	const resumeToolResult = handover || orphanAction === "resume";
-	if (!resumeToolResult) {
-		void promptStream.push(userMessage(promptBlocks ?? [{ type: "text", text: promptText }]))
-			.catch((error) => debug(`provider: initial prompt push rejected:`, error));
-	}
+	const openingBlocks = resumeToolResult
+		? [{ type: "text" as const, text: CONTINUATION_PROMPT }]
+		: promptBlocks ?? [{ type: "text" as const, text: promptText }];
+	void promptStream.push(userMessage(openingBlocks))
+		.catch((error) => debug(`provider: initial prompt push rejected:`, error));
 	queryCtx.promptStream = promptStream;
 	const mcpServers = buildMcpServers(mcpTools, queryCtx);
 
@@ -443,13 +450,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// Manual /compact in CC still works (we never invoke it).
 	const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
 		cwd,
-		env: {
-			...childEnv(process.env, getPiSessionId()),
-			...(resumeToolResult ? {
-				CLAUDE_CODE_RESUME_INTERRUPTED_TURN: "1",
-				CLAUDE_CODE_RESUME_PROMPT: CONTINUATION_PROMPT,
-			} : {}),
-		},
+		env: childEnv(process.env, getPiSessionId()),
 		tools: [],
 		permissionMode: "bypassPermissions",
 		includePartialMessages: true,

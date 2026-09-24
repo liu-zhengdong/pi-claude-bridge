@@ -6,7 +6,8 @@
 //
 // Verifies the turn instead moves to a session rebuilt from the shortened history,
 // in the same turn: the dropped exchange is gone from the session Claude Code
-// resumes and from the size of its next request, the turn still finishes, the next
+// resumes and from the size of its next request, the turn goes on calling tools
+// (issue #23: the resumed request once carried no tools) and finishes, the next
 // turn resumes the rebuilt session as is, and nothing is left behind.
 //
 // Size, not the model's answer, is the check within the turn: thinking written
@@ -29,6 +30,8 @@ const FLAG = join(tmpdir(), `int-midturn-shrink-${process.pid}.flag`);
 // few hundred the handover itself adds to the next request.
 const FILLER = Array.from({ length: 3000 }, (_, i) => i).join(" ");
 const MIN_DROP = 2000;
+// Printed by the bash call that has to follow the handover.
+const AFTER = `AFTER_HANDOVER_${process.pid}`;
 
 const harness = createRpcHarness({
 	name: "midturn-shrink",
@@ -60,7 +63,7 @@ try {
 	// The bash call switches the extension on, so the request carrying its result is
 	// the first to come back without the APPLE exchange: mid-turn, after a tool call.
 	console.log("Turn 3: tool call, then the history shrinks under the live query...");
-	const reply = await promptAndWait(`Create an empty marker file with the bash tool: touch ${FLAG}\nThen confirm that it was created.`);
+	const reply = await promptAndWait(`Make two separate bash tool calls, one at a time:\n1. touch ${FLAG}\n2. echo ${AFTER}\nThen confirm that both ran.`);
 	console.log(`  Reply: ${JSON.stringify(reply.trim())}`);
 
 	const log = readFileSync(DEBUG_LOG, "utf8").slice(mark);
@@ -83,7 +86,8 @@ try {
 	if (before === undefined || after === undefined) throw new Error("usage not logged on both sides of the handover");
 	if (before - after < MIN_DROP) throw new Error(`the request after the handover is not smaller by the dropped exchange: ${before} → ${after}`);
 
-	if (!/creat|done|success|已创建|完成|成功/i.test(reply)) throw new Error(`the turn did not finish in the rebuilt session: ${JSON.stringify(reply)}`);
+	if (!new RegExp(`resolving bash \\[[^\\]]+\\] .*${AFTER}`).test(afterHandover)) throw new Error(`the rebuilt session never ran the second bash call — its request carried no tools? reply: ${JSON.stringify(reply)}`);
+	if (!reply.trim()) throw new Error("the turn ended without a reply in the rebuilt session");
 
 	const warnings = log.split("\n").filter((line) => /WARNING|BUG:/.test(line));
 	if (warnings.length > 0) throw new Error(`warnings during the handover turn:\n${warnings.join("\n")}`);
