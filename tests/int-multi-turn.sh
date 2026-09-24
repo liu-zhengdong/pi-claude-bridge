@@ -61,9 +61,9 @@ run_json "multi-turn: tool use, context, history" \
   pi --no-session -ne -e "$DIR" \
   --model "claude-bridge/claude-haiku-4-5" \
   --mode json \
-  -p "The secret word is 'banana'. Read package.json and tell me the version. Be brief." \
+  -p "The fruit on my shopping list is banana. Read package.json and tell me the version. Be brief." \
      "Now read README.md and tell me the first heading. Be brief." \
-     "What was the secret word I told you earlier? Reply with just the word."
+     "What fruit was on my shopping list earlier? Reply with just the fruit."
 
 # Multiple tool calls in a single turn — the scenario that caused the deadlock
 # when processAssistantMessage didn't end the stream on tool_use.

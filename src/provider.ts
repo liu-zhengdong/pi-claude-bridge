@@ -23,8 +23,8 @@ import type { McpResult } from "./extract-tool-results.js";
 import { createToolServer } from "./mcp-server.js";
 import { claudeCodeModelId } from "./models.js";
 import { newAssistantMessageEventStream } from "./pi-ai-compat.js";
-import { labelUserTurn, messageOrigins, splitUserTurn } from "./message-origin.js";
-import { adaptContext, extractAllToolResults, extractUserPrompt, extractUserPromptBlocks, steerBlocks, turnStart } from "./pi-context.js";
+import { extensionNote, labelUserTurn, messageOrigins, splitUserTurn } from "./message-origin.js";
+import { adaptContext, extractAllToolResults, extractUserPrompt, extractUserPromptBlocks, historyIdentities, historyRewritten, steerBlocks, turnStart } from "./pi-context.js";
 import { projectPromptCapture } from "./prompt-capture.js";
 import { promptCaptures } from "./prompt-record.js";
 import { makePromptStream, userMessage } from "./prompt-stream.js";
@@ -58,6 +58,29 @@ export function reportLeaks(label: string): void {
 	);
 }
 
+
+/** Claude Code's recovery prompt when we rebuild from a tool result. This is
+ *  injected as a meta prompt at resume, not sent as a new user turn. */
+const CONTINUATION_PROMPT = extensionNote(
+	"The previous query stopped after a tool result. Continue the current task from the tool results above.",
+);
+
+/** Ends `c`'s live query when pi's history lost messages that query had already
+ *  been handed, so the turn goes on in a fresh query resumed from a session rebuilt
+ *  out of pi's history (issue #21). Returns whether it did.
+ *
+ *  An extension compacting through the `context` hook (ACP) shortens pi's history
+ *  between two tool calls. Delivering the results into the live query would keep
+ *  Claude Code on the old, longer history until the turn ends — for a long agentic
+ *  turn, every later request of it. */
+function retireIfHistoryRewritten(c: QueryContext, messages: Context["messages"]): boolean {
+	if (!c.retire || !historyRewritten(c.seenHistory, messages)) return false;
+	debug(`provider: pi's history lost messages the live query had been handed, handing the turn to a rebuilt session, ctx.msgs=${messages.length}`);
+	c.retire();
+	// As good as delivered: a retry of this same context must resume the turn, not end it.
+	recordToolResultDelivery(messages.length);
+	return true;
+}
 
 function contextForToolResults(results: McpResult[]): QueryContext | undefined {
 	for (const result of results) {
@@ -212,11 +235,14 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		debug(`provider: active query user-only call treated as reentrant fresh query, waitingHandlers=${ctx().pendingToolCalls.size}, ctx.msgs=${context.messages.length}`);
 	}
 
+	// Only pi's own conversation mirrors pi's history; a reentrant query's is its caller's.
+	const handover = resultCtx === ctx() && retireIfHistoryRewritten(resultCtx, context.messages);
+
 	// --- Tool result delivery ---
 	// Pi appends tool results to context and calls back. Extract this turn's results
 	// (everything after the last assistant message) and match against waiting MCP
 	// handlers. Results that arrive before their handler get queued in pendingResults.
-	if (resultCtx) {
+	if (resultCtx && !handover) {
 		claimCurrentPiStream(stream, "tool-result", resultCtx);
 		resultCtx.resetTurnState(model);
 		// User messages (steer/followUp) pi injected into context during the
@@ -238,11 +264,12 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		// delivering its own results would drag it to that subagent's message count
 		// — observed pulling a parent from 5 back to 3, which cost the parent's next
 		// turn a full rebuild and a flushed prompt cache.
-		if (resultCtx === ctx()) setCursor(context.messages.length);
+		if (resultCtx === ctx()) setCursor(context.messages.length, historyIdentities(context.messages));
 		// Same top-level-only reasoning as the cursor above: a subagent's message
 		// count must not decide what the parent's next call means.
 		if (resultCtx === ctx()) recordToolResultDelivery(context.messages.length);
 		resultCtx.latestCursor = Math.max(resultCtx.latestCursor, context.messages.length);
+		resultCtx.seenHistory = historyIdentities(context.messages);
 		return stream;
 	}
 
@@ -251,7 +278,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// or pi is retrying a turn whose query we killed (resume it). See
 	// orphanedToolResultAction.
 	const lastMsg = context.messages[context.messages.length - 1];
-	const orphanAction = lastMsg?.role === "toolResult"
+	const orphanAction = !handover && lastMsg?.role === "toolResult"
 		? orphanedToolResultAction(context.messages.length, getDeliveredToolResultCursor())
 		: null;
 	if (orphanAction === "resume") {
@@ -259,7 +286,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	}
 	if (orphanAction === "end-turn") {
 		debug(`provider: orphaned tool result after abort, emitting end_turn`);
-		if (activeQueryContexts.size === 0) setCursor(context.messages.length);
+		if (activeQueryContexts.size === 0) setCursor(context.messages.length, historyIdentities(context.messages));
 		// No query owns this result, so there is no context to reset: resetTurnState
 		// on the top-level ctx() would replace a live parent's turnOutput mid-stream,
 		// stranding the blocks it had already emitted. A throwaway context just
@@ -284,9 +311,12 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	//    conversation, so taking the shared context would strand whatever that
 	//    context is mid-turn.
 	const callSessionId = options?.sessionId;
-	const isReentrant = !ownsSharedSession({ side, activeQuery, sessionId: callSessionId }, getPiSessionId());
+	// Read again rather than reusing `activeQuery`: a handover has retired the query
+	// that was live on entry, and pi's turn is what takes the shared context next.
+	const liveQuery = ctx().activeQuery !== null;
+	const isReentrant = !ownsSharedSession({ side, activeQuery: liveQuery, sessionId: callSessionId }, getPiSessionId());
 	const queryCtx = isReentrant ? new QueryContext() : ctx();
-	debug(`provider: fresh query setup, isReentrant=${isReentrant}, activeQuery=${activeQuery}, callSession=${callSessionId?.slice(0, 8) ?? "none"}, piSession=${getPiSessionId()?.slice(0, 8) ?? "none"}, activeContexts=${activeQueryContexts.size}`);
+	debug(`provider: fresh query setup, isReentrant=${isReentrant}, activeQuery=${liveQuery}, handover=${handover}, callSession=${callSessionId?.slice(0, 8) ?? "none"}, piSession=${getPiSessionId()?.slice(0, 8) ?? "none"}, activeContexts=${activeQueryContexts.size}`);
 
 	// Resolved first: an unaccountable system prompt throws, and doing that before
 	// anything is claimed or reset leaves no half-built query behind — in particular
@@ -319,6 +349,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	queryCtx.turnToolCallIds = [];
 	queryCtx.resetTurnState(model);
 	queryCtx.latestCursor = 0;
+	queryCtx.seenHistory = historyIdentities(context.messages);
 
 	const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
 	// cliModel is the actual id sent to Claude Code (may carry [1m]); model.id is the
@@ -348,9 +379,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// Guard: empty prompt means the last context message isn't a user message.
 	// This should never happen with per-query state — dump diagnostics if it does.
 	if (!promptText && !promptBlocks) {
-		// A resumed continuation has no user turn by construction, so it takes the
-		// same "[continue]" recovery below without being an anomaly worth dumping.
-		if (orphanAction !== "resume") diagDump("empty_prompt", {
+		// A resumed continuation or a handover has no user turn by construction, so it
+		// opens with a continuation prompt below without being an anomaly worth dumping.
+		if (orphanAction !== "resume" && !handover) diagDump("empty_prompt", {
 			contextLength: context.messages.length,
 			lastMsgRole: lastMsg?.role,
 			isReentrant,
@@ -359,8 +390,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			sharedSession: (() => { const s = getSharedSession(); return s ? { sessionId: s.sessionId.slice(0, 8), cursor: s.cursor } : null; })(),
 			messageRoles: context.messages.map((m, i) => `[${i}]${m.role}`).join(" "),
 		});
-		// Recover: use a continuation prompt so the SDK doesn't send an empty text block
-		promptText = "[continue]";
+		// Only a genuine orphan with no prior delivery needs the fallback prompt.
+		// Resuming a tool result is handled by Claude Code's interrupted-turn path.
+		if (orphanAction !== "resume" && !handover) promptText = "[continue]";
 	}
 
 	// Always stream the prompt rather than passing a string: a parked input
@@ -369,8 +401,11 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// first result — consumeQuery ends the stream explicitly instead, or the
 	// query would never terminate.
 	const promptStream = makePromptStream();
-	void promptStream.push(userMessage(promptBlocks ?? [{ type: "text", text: promptText }]))
-		.catch((error) => debug(`provider: initial prompt push rejected:`, error));
+	const resumeToolResult = handover || orphanAction === "resume";
+	if (!resumeToolResult) {
+		void promptStream.push(userMessage(promptBlocks ?? [{ type: "text", text: promptText }]))
+			.catch((error) => debug(`provider: initial prompt push rejected:`, error));
+	}
 	queryCtx.promptStream = promptStream;
 	const mcpServers = buildMcpServers(mcpTools, queryCtx);
 
@@ -408,7 +443,13 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// Manual /compact in CC still works (we never invoke it).
 	const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
 		cwd,
-		env: childEnv(process.env, getPiSessionId()),
+		env: {
+			...childEnv(process.env, getPiSessionId()),
+			...(resumeToolResult ? {
+				CLAUDE_CODE_RESUME_INTERRUPTED_TURN: "1",
+				CLAUDE_CODE_RESUME_PROMPT: CONTINUATION_PROMPT,
+			} : {}),
+		},
 		tools: [],
 		permissionMode: "bypassPermissions",
 		includePartialMessages: true,
@@ -474,10 +515,30 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		else options.signal.addEventListener("abort", onAbort, { once: true });
 	}
 
+	// A handover (retireIfHistoryRewritten) ends this query while pi's turn goes on in
+	// a fresh one on the same context. From then on nothing below may touch that
+	// context, its stream or the shared session: they belong to the fresh query.
+	let superseded = false;
+	const retire = () => {
+		superseded = true;
+		options?.signal?.removeEventListener("abort", onAbort);
+		drainForAbort(queryCtx, promptStream);
+		requestAbort();
+		queryCtx.retire = null;
+		if (queryCtx.activeQuery === sdkQuery) queryCtx.activeQuery = null;
+		if (queryCtx.promptStream === promptStream) queryCtx.promptStream = null;
+		activeQueryContexts.delete(queryCtx);
+		// As after an abort, the killed subprocess may still flush records into the
+		// session it resumed, so the rebuild takes a fresh id rather than that file.
+		markNeedsRebuild({ forceRotate: true });
+	};
+	if (!isReentrant) queryCtx.retire = retire;
+
 	// Background consumer — runs until query ends
-	consumeQuery(sdkQuery, customToolNameToPi, model, () => wasAborted, queryCtx)
+	consumeQuery(sdkQuery, customToolNameToPi, model, () => wasAborted || superseded, queryCtx)
 		.then(async ({ capturedSessionId }) => {
-			debug(`provider: consumeQuery completed, stopReason=${queryCtx.turnOutput?.stopReason}, error=${queryCtx.turnOutput?.errorMessage}, aborted=${wasAborted}`);
+			debug(`provider: consumeQuery completed, stopReason=${queryCtx.turnOutput?.stopReason}, error=${queryCtx.turnOutput?.errorMessage}, aborted=${wasAborted}, superseded=${superseded}`);
+			if (superseded) return;
 
 			// --- Abort detection in normal completion path ---
 			if (wasAborted || options?.signal?.aborted) {
@@ -508,7 +569,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			} else if (sessionId) {
 				const cursor = Math.max(context.messages.length, queryCtx.latestCursor, getSharedSession()?.cursor ?? 0);
 				debug(`provider: query done, session=${sessionId.slice(0, 8)}, cursor=${cursor}`);
-				adoptSession(sessionId, cursor, cwd);
+				adoptSession(sessionId, cursor, cwd, queryCtx.seenHistory);
 			}
 
 			if (!isReentrant && queryCtx.activeQuery === sdkQuery) {
@@ -518,7 +579,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			finalizeCurrentStream(queryCtx, queryCtx.turnOutput?.stopReason);
 		})
 		.catch((error) => {
-			debug(`provider: query error, model=${cliModel}, aborted=${Boolean(options?.signal?.aborted)}, error=`, error);
+			debug(`provider: query error, model=${cliModel}, aborted=${Boolean(options?.signal?.aborted)}, superseded=${superseded}, error=`, error);
+			if (superseded) return;
 			// Not for a reentrant query: it owns no part of the shared session, and
 			// discarding pi's on its behalf would cost the next real turn a full rebuild
 			// over a failure that had nothing to do with it.
@@ -558,13 +620,16 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			// has already deleted it and this is a no-op.
 			if (isReentrant && syncResult.sessionId) deleteSession(syncResult.sessionId, cwd, process.env.CLAUDE_CONFIG_DIR);
 			if (queryCtx.promptStream === promptStream) queryCtx.promptStream = null;
+			if (queryCtx.retire === retire) queryCtx.retire = null;
 			// A later query claiming this context sets activeQuery to its own handle;
 			// null means the .then/.catch above cleared ours and nothing replaced it.
 			// Testing only for `=== sdkQuery` would never fire on the non-reentrant
 			// path, leaving the top-level context in the routing set forever — where a
 			// later orphaned tool result matches its stale turnToolCallIds and takes
 			// the delivery branch, returning a stream nothing ends.
-			if (queryCtx.activeQuery === sdkQuery || queryCtx.activeQuery === null) {
+			// A retired query let go of all of this in retire(), and the context now
+			// belongs to the query that replaced it.
+			if (!superseded && (queryCtx.activeQuery === sdkQuery || queryCtx.activeQuery === null)) {
 				queryCtx.releasePendingToolCalls("Query ended");
 				queryCtx.activeQuery = null;
 				activeQueryContexts.delete(queryCtx);

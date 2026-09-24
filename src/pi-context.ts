@@ -37,6 +37,30 @@ export function turnStart(messages: Context["messages"]): number {
 	return i;
 }
 
+/** Stable, ordered message identities. No body hashing: trimming a tool output or
+ *  removing thinking doesn't change the conversation's identity. Tool-call IDs
+ *  are included so removing a call from an otherwise unchanged assistant is visible.
+ *  The current user turn is excluded by the caller until it has been delivered. */
+export function historyIdentities(messages: Context["messages"]): string[] {
+	return messages.map((message) => {
+		if (message.role === "assistant") {
+			return `assistant:${message.timestamp}:${message.content.filter((b) => b.type === "toolCall").map((b) => b.id).join(",")}`;
+		}
+		if (message.role === "toolResult") return `result:${message.toolCallId}:${message.timestamp}`;
+		return `${message.role}:${message.timestamp}`;
+	});
+}
+
+/** A Claude Code session can be reused only if everything already handed to it
+ *  is still an ordered prefix of pi's history. Additions at the end are allowed. */
+export function historyMatches(seen: readonly string[], current: readonly string[]): boolean {
+	return seen.length <= current.length && seen.every((key, i) => key === current[i]);
+}
+
+export function historyRewritten(seen: readonly string[], messages: Context["messages"]): boolean {
+	return !historyMatches(seen, historyIdentities(messages));
+}
+
 /** Extract the current user turn as a prompt string. Returns null if the last message is not a user message. */
 export function extractUserPrompt(messages: Context["messages"]): string | null {
 	const turn = messages.slice(turnStart(messages)) as UserMessage[];

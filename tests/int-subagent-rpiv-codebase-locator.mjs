@@ -25,6 +25,10 @@ const REENTRANT_MARKER = /provider: active query user-only call treated as reent
 const STUCK_MARKER = /MCP handlers still waiting after delivering 0 results|tool handler\(s\) still waiting|currentPiStream overwritten/;
 assert.ok(existsSync(RPIV_LOCATOR_FIXTURE), `missing rpiv codebase-locator fixture: ${RPIV_LOCATOR_FIXTURE}`);
 
+// npm test propagates the caller's project allow-scripts setting as an env var;
+// even with a clean userconfig, npm rejects that global allowlist for pi's
+// temporary project-scoped install. This process is just the isolated fixture.
+delete process.env.npm_config_allow_scripts;
 const testAgentDir = mkdtempSync(join(tmpdir(), "subagent-rpiv-locator-dir-"));
 const testProjectDir = mkdtempSync(join(tmpdir(), "subagent-rpiv-locator-project-"));
 mkdirSync(join(testProjectDir, ".pi", "agents"), { recursive: true });
@@ -37,7 +41,10 @@ const harness = createRpcHarness({
 	name: "subagent-rpiv-codebase-locator",
 	args: ["-e", SUBAGENTS_SOURCE, "--model", BRIDGE_MODEL],
 	cwd: testProjectDir,
-	env: { PI_CODING_AGENT_DIR: testAgentDir },
+	// pi's temporary extension install is project-scoped: a user npmrc with a
+	// global allow-scripts list makes npm 11 reject it before the test starts.
+	// Use a clean npm config and disable lifecycle scripts for this fixture only.
+	env: { PI_CODING_AGENT_DIR: testAgentDir, NPM_CONFIG_USERCONFIG: "/dev/null", NPM_CONFIG_IGNORE_SCRIPTS: "true" },
 	defaultTimeout: TEST_TIMEOUT,
 });
 

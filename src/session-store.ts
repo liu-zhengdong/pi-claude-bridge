@@ -12,6 +12,9 @@ export interface SessionState {
 	sessionId: string;
 	cursor: number;
 	cwd: string;
+	/** Identity of each pi message already reflected in the Claude Code session.
+	 *  The cursor alone cannot detect a same-length replacement or reorder. */
+	history?: readonly string[];
 	// Force the next syncSharedSession call down the REBUILD path. Set when
 	// pi has mutated its messages array out from under us (compact, tree
 	// navigation) or after an abort left the JSONL in an indeterminate state.
@@ -50,19 +53,22 @@ export function clearSharedSession(): void {
 }
 
 /** Take a freshly created or resumed Claude Code session as the shared one. */
-export function adoptSession(sessionId: string, cursor: number, cwd: string): void {
-	sharedSession = { sessionId, cursor, cwd };
+export function adoptSession(sessionId: string, cursor: number, cwd: string, history: readonly string[]): void {
+	sharedSession = { sessionId, cursor, cwd, history };
 }
 
 /** Move the cursor on the existing record, in place. */
-export function setCursor(cursor: number): void {
-	if (sharedSession) sharedSession.cursor = cursor;
+export function setCursor(cursor: number, history: readonly string[]): void {
+	if (sharedSession) {
+		sharedSession.cursor = cursor;
+		sharedSession.history = history;
+	}
 }
 
 /** Replace the record with an advanced cursor and cwd — the REUSE path, where
  *  the session is kept but the conversation has moved on. */
-export function advanceCursor(cursor: number, cwd: string): void {
-	if (sharedSession) sharedSession = { ...sharedSession, cursor, cwd };
+export function advanceCursor(cursor: number, cwd: string, history: readonly string[]): void {
+	if (sharedSession) sharedSession = { ...sharedSession, cursor, cwd, history };
 }
 
 /** Send the next sync down the REBUILD path. `forceRotate` additionally takes a

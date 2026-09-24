@@ -108,6 +108,7 @@ describe("tool-message integration", () => {
 	});
 
 	it("parallel tool calls with steer delivers all results", { timeout: TEST_TIMEOUT }, async () => {
+		const mark = logMark();
 		const collector = collectText();
 		await send({
 			type: "prompt",
@@ -125,11 +126,15 @@ describe("tool-message integration", () => {
 		// All three tools should have their results in the response
 		const matches = (text.match(/slowtool completed/gi) || []).length;
 		assert.ok(matches >= 3, `Expected 3 SlowTool results, found ${matches}: ${text.slice(0, 300)}`);
-		// Delivery only forwards a steer when the trailing message is a user message.
-		// Pi injects drained steers between tool results too (see extract-tool-results),
-		// and in that shape the steer would be dropped and the cursor advanced past it,
-		// so Claude never sees it. Asserting results survive does not catch that.
-		assert.match(text.toLowerCase(), /papaya/, `Steer during parallel tools not visible to assistant: ${text.slice(0, 300)}`);
+		// Assert CC received the steer, not that Haiku obeyed it: CC presents a
+		// queued_command next to tool results, which the model can mistake for an
+		// injection and legitimately decline. A dropped steer has no attachment.
+		const records = readSessionRecords(sessionIdFrom(logSince(mark)));
+		const steerAt = records.findIndex((r) => r.attachment?.type === "queued_command"
+			&& JSON.stringify(r.attachment.prompt ?? "").includes("PAPAYA"));
+		assert.notEqual(steerAt, -1, "parallel tool steer never reached CC as a queued command");
+		assert.ok(records.slice(steerAt).some((r) => r.type === "assistant"),
+			"CC never responded after receiving the parallel-tool steer");
 	});
 
 	it("steer during text response (no tool call) completes both turns", { timeout: TEST_TIMEOUT }, async () => {
@@ -157,13 +162,10 @@ describe("tool-message integration", () => {
 		assert.match(text.toLowerCase(), /pineapple/);
 	});
 
-	it("steer during tool execution is visible to assistant", { timeout: 20_000 }, async () => {
-		// Bug: when a steer arrives during tool execution, pi drains it at the turn
-		// boundary and injects it into context alongside the tool result. The bridge
-		// sees activeQuery=true, enters tool-result-delivery mode, extracts the tool
-		// result, but silently ignores the trailing user message (the steer). Claude
-		// never sees the steer content.
-		const collector = collectText();
+	it("steer during tool execution reaches CC", { timeout: 20_000 }, async () => {
+		// At the tool boundary Pi injects the steer alongside the tool result.
+		// Confirm CC received it, not that the model chose to say the magic word.
+		const mark = logMark();
 		await send({
 			type: "prompt",
 			message: "Call SlowTool with seconds=2. After it returns, repeat exactly what it returned.",
@@ -175,8 +177,12 @@ describe("tool-message integration", () => {
 			streamingBehavior: "steer",
 		});
 		await waitForEvent("agent_end");
-		const text = collector.stop();
-		assert.match(text.toLowerCase(), /mango/, `Steer content not visible to assistant: ${text.slice(0, 300)}`);
+		const records = readSessionRecords(sessionIdFrom(logSince(mark)));
+		const steerAt = records.findIndex((r) => r.attachment?.type === "queued_command"
+			&& JSON.stringify(r.attachment.prompt ?? "").includes("MANGO"));
+		assert.notEqual(steerAt, -1, "steer never reached CC after the tool call");
+		assert.ok(records.slice(steerAt).some((r) => r.type === "assistant"),
+			"CC never responded after the steer");
 	});
 
 	it("steer is drained at the tool boundary, mid-turn", { timeout: 90_000 }, async () => {
@@ -194,17 +200,14 @@ describe("tool-message integration", () => {
 		// prompt with no attachment at all.
 		const mark = logMark();
 		const steerText = "STOP. Do not call SlowTool again. Reply with only the word BANANA.";
-		let toolStarts = 0;
-		const removeCounter = addListener((msg) => { if (msg.type === "tool_execution_start") toolStarts++; });
 
 		await send({
 			type: "prompt",
-			message: "Call SlowTool with seconds=1 exactly 12 times, strictly one at a time — wait for each result before starting the next. Do not call it twice in the same message.",
+			message: "Call SlowTool with seconds=1 exactly 4 times, strictly one at a time — wait for each result before starting the next. Do not call it twice in the same message.",
 		});
 		await waitForEvent("tool_execution_start");
 		await send({ type: "prompt", message: steerText, streamingBehavior: "steer" });
 		await waitForEvent("agent_end");
-		removeCounter();
 
 		const records = readSessionRecords(sessionIdFrom(logSince(mark)));
 		const steerAt = records.findIndex((r) => r.attachment?.type === "queued_command"
@@ -220,8 +223,8 @@ describe("tool-message integration", () => {
 		assert.ok(records.slice(steerAt).some((r) => r.type === "assistant"),
 			"CC never responded after draining the steer");
 
-		// Corroborating, not proof: the model should abandon its 12-call loop.
-		assert.ok(toolStarts <= 6, `${toolStarts} of 12 tool calls ran before Claude acted on the steer`);
+		// This proves when CC received the steer, not whether the model chose to obey it.
+		// Haiku may run all four calls even with the queued command at the right boundary.
 	});
 
 	it("steer at a text-only boundary is not pushed into the active query", { timeout: TEST_TIMEOUT }, async () => {

@@ -28,6 +28,12 @@ export class QueryContext {
 	turnToolCallIds: string[] = [];
 	/** Streaming-input handle for the active query — how steers reach CC mid-turn. */
 	promptStream: PromptStream | null = null;
+	/** Ordered identities of the last context handed to this query. A lost,
+	 *  replaced or reordered prefix triggers a handover during a live tool turn. */
+	seenHistory: readonly string[] = [];
+	/** Ends the active query without touching what replaces it: set by the provider
+	 *  while a query runs, for a handover to a rebuilt session (issue #21). */
+	retire: (() => void) | null = null;
 	/** Last rate-limit rejection seen on this query. Claude Code sends it just before the
 	 *  failure it caused, which is the only thing tying the two together. */
 	rateLimitRejection: { rateLimitType?: string; resetsAt?: number } | null = null;

@@ -224,6 +224,45 @@ test("result.modelUsage reports the served context window", { timeout: 120_000 }
 
 // --- Streaming ---
 
+test("resuming an imported tool result continues the interrupted turn without a second user prompt", { timeout: 120_000 }, async () => {
+	// The mid-turn history handover rebuilds a CC session ending at a tool result.
+	// If CC stops treating these env vars as an interrupted-turn continuation,
+	// it may insert "No response requested." and close without answering.
+	const cwd = mkdtempSync(join(tmpdir(), "cc-resume-contract-"));
+	const session = createSession({ projectPath: cwd, model: MODEL });
+	const toolUseId = "toolu_01ResumeContract000000001";
+	session.importMessages([
+		{ role: "user", content: "Compute 6*7 with the calc tool, then reply with RESULT:42." },
+		{ role: "assistant", content: [{ type: "tool_use", id: toolUseId, name: "mcp__custom-tools__calc", input: { expr: "6*7" } }] },
+		{ role: "user", content: [{ type: "tool_result", tool_use_id: toolUseId, content: "42" }] },
+	]);
+	session.save();
+	let release;
+	const held = new Promise((resolve) => { release = resolve; });
+	async function* parkedPrompt() { await held; }
+	const q = query({
+		prompt: parkedPrompt(),
+		options: providerOptions({
+			cwd, resume: session.sessionId,
+			env: { ...process.env, CLAUDE_CODE_RESUME_INTERRUPTED_TURN: "1", CLAUDE_CODE_RESUME_PROMPT: "Continue the current task from the tool result above." },
+		}),
+	});
+	const texts = [];
+	let result = null;
+	try {
+		for await (const message of q) {
+			if (message.type === "assistant") for (const block of message.message?.content ?? []) if (block.type === "text") texts.push(block.text);
+			if (message.type === "result") { result = message; break; }
+		}
+		assert.ok(result && !result.is_error, `no successful continuation result: ${JSON.stringify(result)}`);
+		assert.match(texts.join(" "), /RESULT:\s*42/, `CC did not answer from the imported tool result: ${JSON.stringify(texts)}`);
+	} finally {
+		release();
+		q.close();
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
 test("includePartialMessages yields the stream_event shapes processStreamEvent destructures", { timeout: 120_000 }, async () => {
 	const events = new Set();
 	const contentBlocks = new Set();
