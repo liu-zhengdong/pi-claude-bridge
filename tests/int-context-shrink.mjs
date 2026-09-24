@@ -5,7 +5,7 @@
 // turn from an empty Claude Code session, so the model lost the conversation.
 //
 // Verifies that turn instead resumes a session rebuilt from the shortened history:
-// the exchange the extension kept is in it, the one it dropped is not.
+// the retained exchange is in it, and the dropped user's prompt is not.
 
 console.log("=== int-context-shrink.mjs ===");
 
@@ -58,9 +58,15 @@ try {
 	// Only what the rebuild wrote: the records before turn 3's own prompt.
 	const records = readFileSync(jsonlPath, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
 	const promptIndex = records.findIndex((r) => r.type === "user" && JSON.stringify(r.message?.content ?? "").includes("List every codeword"));
-	const rebuilt = JSON.stringify(promptIndex === -1 ? records : records.slice(0, promptIndex));
+	const rebuiltRecords = promptIndex === -1 ? records : records.slice(0, promptIndex);
+	const rebuilt = JSON.stringify(rebuiltRecords);
 	if (!rebuilt.includes("BANANA")) throw new Error("the rebuilt session lacks the exchange the extension kept (BANANA)");
-	if (rebuilt.includes("APPLE")) throw new Error("the rebuilt session still holds the exchange the extension dropped (APPLE)");
+	// Pi can retain references to APPLE inside the second assistant's thinking;
+	// those remain authoritative history. Only the dropped user exchange must go.
+	const userPrompts = rebuiltRecords.filter((r) => r.type === "user").map((r) => JSON.stringify(r.message?.content ?? ""));
+	if (userPrompts.some((text) => text.includes("Remember the codeword APPLE"))) {
+		throw new Error("the rebuilt session still holds the user exchange the extension dropped (APPLE)");
+	}
 
 	console.log("PASS");
 } catch (e) {

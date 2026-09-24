@@ -4,15 +4,21 @@
 
 set -euo pipefail
 
-# Auto-load .env.test so these scripts work when invoked directly and not just via
-# `npm test`, which sources it for the whole chain. Mirrors tests/lib/rpc-harness.mjs,
-# which already does this for the .mjs tests.
+# Auto-load .env.test for bash integration tests, whether run alone or via
+# `npm test`. RPC tests load it in tests/lib/rpc-harness.mjs.
 __ENV_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/.env.test"
 if [[ -f "$__ENV_FILE" ]]; then
+	# Explicit per-run provider overrides take precedence over the test defaults,
+	# as they do in the JavaScript RPC harness.
+	__ALT_PROVIDER_OVERRIDE="${CLAUDE_BRIDGE_TESTING_ALT_PROVIDER:-}"
+	__ALT_MODEL_OVERRIDE="${CLAUDE_BRIDGE_TESTING_ALT_MODEL:-}"
 	set -a
 	# shellcheck disable=SC1090
 	source "$__ENV_FILE"
 	set +a
+	if [[ -n "$__ALT_PROVIDER_OVERRIDE" ]]; then export CLAUDE_BRIDGE_TESTING_ALT_PROVIDER="$__ALT_PROVIDER_OVERRIDE"; fi
+	if [[ -n "$__ALT_MODEL_OVERRIDE" ]]; then export CLAUDE_BRIDGE_TESTING_ALT_MODEL="$__ALT_MODEL_OVERRIDE"; fi
+	unset __ALT_PROVIDER_OVERRIDE __ALT_MODEL_OVERRIDE
 fi
 
 # Strip node_modules/.bin from PATH so we use the system pi, not the vendored one.

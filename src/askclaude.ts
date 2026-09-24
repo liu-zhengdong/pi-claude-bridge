@@ -20,7 +20,6 @@ import { claudeCodeModelId } from "./models.js";
 import { collectPromptSkills } from "./prompt-capture.js";
 import { promptCaptures } from "./prompt-record.js";
 import { getLongContextSettings, getPiSessionId, getProviderSettings, resolveModel, setAskClaudeToolName } from "./runtime-config.js";
-import { getSharedSession } from "./session-store.js";
 import { syncSharedSession } from "./session-sync.js";
 import { renderSkillsBlock } from "./skills.js";
 
@@ -78,23 +77,15 @@ async function promptAndWait(
 	const modelId = model?.id ?? requestedModel;
 	const cliModel = model ? claudeCodeModelId(model, getLongContextSettings()) : modelId;
 
-	// Session resume for shared mode — reuse provider's session if it exists,
-	// otherwise create one from pi's context.
-	// Note: doesn't update sharedSession.cursor after completion, so the next
-	// provider call will see missed messages and trigger a Case 4 rebuild.
+	// Shared mode follows the same Pi-authoritative history check as the provider.
+	// Another provider may have added or rewritten turns since Claude Code last ran;
+	// resuming its session solely because it exists would silently skip them.
+	// Note: AskClaude's own reply is not in Pi's history yet, so the next provider
+	// call checks again and rebuilds if the two histories have diverged.
 	let resumeSessionId: string | null = null;
 	if (!options?.isolated && options?.context?.length) {
-		const shared = getSharedSession();
-		if (shared) {
-			// Provider already has a session — just resume from it
-			// Any missed messages from other providers were already handled by the provider's Case 4
-			resumeSessionId = shared.sessionId;
-		} else {
-			// No provider session yet — create one from pi's context
-			const contextWithPrompt = [...options.context, { role: "user" as const, content: prompt, timestamp: Date.now() }];
-			const sync = syncSharedSession(contextWithPrompt as Context["messages"], cwd, undefined, cliModel);
-			resumeSessionId = sync.sessionId;
-		}
+		const contextWithPrompt = [...options.context, { role: "user" as const, content: prompt, timestamp: Date.now() }];
+		resumeSessionId = syncSharedSession(contextWithPrompt as Context["messages"], cwd, undefined, cliModel).sessionId;
 	}
 
 	// Mode → disallowed tools

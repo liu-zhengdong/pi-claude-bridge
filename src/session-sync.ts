@@ -14,7 +14,7 @@ import { realpathSync, statSync } from "fs";
 import { collectCarriedAttachments, placeCarriedAttachments, type CarriedAttachment } from "./attachments.js";
 import { convertPiMessages } from "./convert.js";
 import { DEBUG, DEBUG_LOG_PATH, debug, diagDump } from "./debug.js";
-import { turnStart } from "./pi-context.js";
+import { historyIdentities, historyMatches, turnStart } from "./pi-context.js";
 import { getPiUI } from "./runtime-config.js";
 import { advanceCursor, adoptSession, getSharedSession } from "./session-store.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
@@ -217,27 +217,26 @@ export function syncSharedSession(
 	modelId?: string,
 ): SyncResult {
 	const priorMessages = messages.slice(0, turnStart(messages)); // everything before the current user turn
+	const priorHistory = historyIdentities(priorMessages);
 
 	// REUSE path
 	//
-	// Guard on priorMessages.length >= cursor: a shorter incoming context cannot
-	// be a continuation of the cached session. This is the general invariant for
-	// pi-side history rewrites such as /compact and session_tree: without it,
-	// missed = [].slice(cursor) can falsely hit REUSE and resume an unrelated
-	// longer CC session. See issue #25.
-	//
-	// A shorter context falls through to REBUILD. /compact, session_tree, /new and
-	// fork announce themselves and set needsRebuild or clear the session first; an
-	// extension compacting through the `context` hook (ACP) does not, and this guard
-	// is the only place its rewrite shows.
+	// Reuse only while the mirrored messages remain the same ordered prefix.
+	// A cursor alone misses same-length edits, reorders and removal of older turns
+	// followed by new ones. Pi can rewrite history through a `context` hook (ACP)
+	// without announcing compaction, so the next request itself must check this.
+	// Later messages are handled below: only the expected trailing assistant may
+	// advance a cached session; anything else requires a rebuild.
 	const existing = getSharedSession();
-	if (existing && !existing.needsRebuild && priorMessages.length >= existing.cursor) {
+	const prefixMatches = !!existing?.history && existing.history.length === existing.cursor
+		&& historyMatches(existing.history, priorHistory) && existing.cwd === cwd;
+	if (existing && !existing.needsRebuild && prefixMatches) {
 		const missed = priorMessages.slice(existing.cursor);
 		const trailingAssistantOnly =
 			missed.length === 1 && (missed[0] as { role?: string }).role === "assistant";
 		if (missed.length === 0 || trailingAssistantOnly) {
 			if (trailingAssistantOnly) {
-				advanceCursor(priorMessages.length, cwd);
+				advanceCursor(priorMessages.length, cwd, priorHistory);
 			}
 			// Re-read: advanceCursor replaces the record, so `existing` is stale here.
 			const session = getSharedSession()!;
@@ -247,8 +246,8 @@ export function syncSharedSession(
 		}
 	}
 	// REBUILD path
-	if (existing && !existing.needsRebuild && priorMessages.length < existing.cursor) {
-		debug(`Case 4 rewritten: ${priorMessages.length} prior messages, fewer than cursor=${existing.cursor} — pi's history was rewritten without session_compact`);
+	if (existing && !existing.needsRebuild && !prefixMatches) {
+		debug(`Case 4 rewritten: ${priorMessages.length} prior messages do not match cached cursor=${existing.cursor} and ordered history — rebuilding from pi`);
 	}
 	if (priorMessages.length === 0) {
 		debug(`Case 1: clean start, ${messages.length} total messages`);
@@ -263,10 +262,10 @@ export function syncSharedSession(
 	// concurrent writer we shouldn't race — see forceRotate docs above.
 	const preserveId = previousSessionId !== undefined && !existing?.forceRotate;
 	// Before deleteSession — it wipes the file these live in.
-	const carried = previousSessionId !== undefined ? readCarriedAttachments(previousSessionId, cwd) : [];
+	const carried = previousSessionId !== undefined ? readCarriedAttachments(previousSessionId, existing!.cwd) : [];
 	if (preserveId) {
 		// Wipe prior jsonl + companion dir (no-op if nothing to wipe).
-		deleteSession(previousSessionId!, cwd, process.env.CLAUDE_CONFIG_DIR);
+		deleteSession(previousSessionId!, existing!.cwd, process.env.CLAUDE_CONFIG_DIR);
 	}
 	const session = createSession({
 		projectPath: cwd,
@@ -279,7 +278,7 @@ export function syncSharedSession(
 	// records, not messages: `messages` filters out the attachment records that
 	// carrying an `@file` expansion across a rebuild writes into the same file.
 	verifyWrittenSession(session.jsonlPath, session.sessionId, session.records.length, cwd);
-	adoptSession(session.sessionId, priorMessages.length, cwd);
+	adoptSession(session.sessionId, priorMessages.length, cwd, priorHistory);
 	if (previousSessionId === undefined) {
 		debug(`Case 2: first turn with ${priorMessages.length} prior messages → session ${session.sessionId.slice(0, 8)}, ${session.records.length} records`);
 	} else if (preserveId) {

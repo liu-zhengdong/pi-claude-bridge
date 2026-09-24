@@ -1,12 +1,10 @@
 # Agent Guidelines
 
-## Restricted Actions
+## GitHub Boundary
 
-Commit and push finished work to `origin` directly, without asking first.
+Commit and push finished work to `origin` directly, without asking first. For authorized work on this fork, PRs to `liu-zhengdong/pi-claude-bridge` targeting `schuettc-publish` are the normal delivery path; no separate permission is needed to open them. Do not open PRs against `schuettc/pi-claude-bridge` or comment on public issues without explicit permission.
 
-Do **not** interact with the public without explicit permission. For example, do not open PRs or comment on github issues unless I say so.
-
-This checkout has an `upstream` remote (schuettc), which `gh` picks as its default repo unless `gh repo set-default liu-zhengdong/pi-claude-bridge` has been run — a bare `gh issue create` or `gh pr create` then posts upstream, in public. Pass `--repo liu-zhengdong/pi-claude-bridge` (and `--base schuettc-publish` for PRs).
+This checkout has an `upstream` remote (schuettc), which `gh` may choose by default. Specify `--repo liu-zhengdong/pi-claude-bridge` for GitHub commands and `--base schuettc-publish` for PRs; check the target before creating a PR.
 
 ## Claims about how Claude Code behaves
 

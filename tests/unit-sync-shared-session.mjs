@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { createSession, deleteSession, openSession } from "cc-session-io";
 
 const { __test } = await import("../src/index.js");
+const { historyIdentities } = await import("../src/pi-context.js");
 
 describe("syncSharedSession", () => {
 	afterEach(() => {
@@ -41,6 +42,42 @@ describe("syncSharedSession", () => {
 			assert.equal(written.messages.length, 2, "the rewritten history must reach Claude Code");
 		} finally {
 			deleteSession(sessionId, cwd);
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("reuses a matching ordered prefix, but rebuilds same-length replacements and reorders", () => {
+		const cwd = mkdtempSync(join(tmpdir(), "sync-shared-identity-"));
+		const original = [
+			{ role: "user", content: "first", timestamp: 1 },
+			{ role: "assistant", content: [{ type: "text", text: "second" }], timestamp: 2 },
+			{ role: "user", content: "third", timestamp: 3 },
+			{ role: "assistant", content: [{ type: "text", text: "fourth" }], timestamp: 4 },
+		];
+		const cases = [
+			{ label: "matching", prior: original, reuse: true },
+			{ label: "replacement", prior: [{ ...original[0], content: "replacement", timestamp: 13 }, ...original.slice(1)], reuse: false },
+			{ label: "reorder", prior: [...original.slice(2), ...original.slice(0, 2)], reuse: false },
+			{ label: "trailing assistant", prior: [...original, { role: "assistant", content: [{ type: "text", text: "last" }], timestamp: 4 }], reuse: true },
+		];
+		try {
+			for (const { label, prior, reuse } of cases) {
+				const id = randomUUID();
+				const seeded = createSession({ sessionId: id, projectPath: cwd });
+				seeded.importMessages([{ role: "user", content: "first" }, { role: "assistant", content: "second" }, { role: "user", content: "third" }, { role: "assistant", content: "fourth" }]);
+				seeded.save();
+				__test.setSharedSession({ sessionId: id, cwd, cursor: original.length, history: historyIdentities(original) });
+				const next = { role: "user", content: "next turn", timestamp: 10 };
+				const synced = __test.syncSharedSession([...prior, next], cwd);
+				assert.equal(synced.sessionId, id, `${label}: keep the session ID without a concurrent writer`);
+				assert.equal(__test.getSharedSession().cursor, prior.length, label);
+				assert.deepEqual(__test.getSharedSession().history, historyIdentities(prior), label);
+				const persisted = openSession({ sessionId: id, projectPath: cwd });
+				assert.equal(persisted.messages.length, reuse ? original.length : prior.length, `${label}: only rewrites when history diverges`);
+				if (!reuse) assert.match(JSON.stringify(persisted.messages), label === "replacement" ? /replacement/ : /second/);
+				deleteSession(id, cwd);
+			}
+		} finally {
 			rmSync(cwd, { recursive: true, force: true });
 		}
 	});
