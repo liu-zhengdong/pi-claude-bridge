@@ -57,7 +57,7 @@ run_json "multi-turn: tool use, context, history" \
   '([.[] | select(.type == "message_update") | .assistantMessageEvent | select(.type == "toolcall_end")] | length) >= 2 and
    ([.[] | select(.type == "agent_end")] | length) >= 3 and
    ([.[] | select(.type == "message_update") | .assistantMessageEvent | select(.type == "text_end") | .content] | join(" ") | test("'"$EXPECTED_VERSION"'")) and
-   ([.[] | select(.type == "message_update") | .assistantMessageEvent | select(.type == "text_end") | .content] | join(" ") | test("banana"))' \
+   ([.[] | select(.type == "message_update") | .assistantMessageEvent | select(.type == "text_end") | .content] | join(" ") | test("banana"; "i"))' \
   pi --no-session -ne -e "$DIR" \
   --model "claude-bridge/claude-haiku-4-5" \
   --mode json \

@@ -2,7 +2,7 @@
 
 ## UNRELEASED
 
-- **Fix: restore Claude context after Pi rewrites history (#21).** Treat Pi's ordered messages as authoritative; rebuild a stale shared or live Claude Code session after edits, pruning, or mid-turn compaction while keeping matching sessions fast. Resume pending tool results and steering in the rebuilt session.
+- **Bump: resolve MCP SDK transitive dependency advisories** — refresh the lockfile within existing semver ranges (SDK remains `1.29.0`), updating Hono, fast-uri, ip-address, and related packages. `npm audit --omit=dev` reports zero vulnerabilities after the update.
 
 - **Fix: keep Claude Code's cached history aligned with pi, including mid-turn compaction (#21)** — A live tool turn now checks the ordered identity of every pi message already handed to Claude Code before delivering another result. If pi rewrote that history, the bridge retires the old query and continues the same turn in a session rebuilt from pi's current history; the next turn can reuse it. Fresh provider turns and shared AskClaude calls apply the same check instead of trusting a message count or an existing session id. Resuming a rebuilt session after a tool result uses Claude Code's interrupted-turn continuation, avoiding a second user prompt that could make it stop before answering. Covered by unit tests for replacements, reorders and appended messages, and live mid-turn shrink and session-resume tests.
 
