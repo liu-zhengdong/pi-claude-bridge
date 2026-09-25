@@ -10,9 +10,13 @@ import { debug, diagDump } from "./debug.js";
 import { PromptCaptures } from "./prompt-capture.js";
 import { extensionAdditions, type AssemblyOptions } from "./prompt-extensions.js";
 
-// Captures of what pi assembled per agent; see src/prompt-capture.ts for why this
-// is keyed rather than held in a single slot.
-export const promptCaptures = new PromptCaptures(256, (diagnostic) => {
+// A child Pi session can evaluate this extension as a separate module instance.
+// Its provider shell still routes requests to the first instance (which owns the
+// in-flight tools), so both must see the same prompt captures. Keep the bounded
+// registry process-wide; each activation's recorder still owns its own options.
+const CAPTURES_KEY = Symbol.for("claude-bridge:promptCaptures");
+const shared = globalThis as Record<symbol, PromptCaptures | undefined>;
+export const promptCaptures = shared[CAPTURES_KEY] ??= new PromptCaptures(256, (diagnostic) => {
 	const first = diagnostic.matches[0];
 	// A prompt that shares a long prefix with a known key but still resolves against
 	// nothing is a pi assembly that drifted after we recorded it — the subagent-
