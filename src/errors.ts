@@ -7,7 +7,7 @@ import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 /** Explain the confirmed login error without assuming why Claude Code cannot read it.
  * A bare 401 or "Authentication required" can also come from an API or remote
  * settings request, so do not tell those callers to approve a Keychain prompt. */
-function explainLoginFailure(text: string): string {
+export function explainLoginFailure(text: string): string {
 	const original = text.trim();
 	if (!/^Not logged in(?:\s*[·-]\s*(?:Please )?run \/login)?$/i.test(original)) return text;
 	return `读不到 Claude 登录（${original}）。如果在 Mac 上，钥匙串可能在等待授权；确认请求的程序是你使用的 Claude 后选择「始终允许」。`;

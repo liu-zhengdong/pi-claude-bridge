@@ -12,7 +12,7 @@ import { QueryContext } from "../src/query-state.js";
 
 const { __test } = await import("../src/index.js");
 
-const fakeModel = { api: "anthropic-messages", provider: "anthropic", id: "test-model" };
+const fakeModel = { api: "anthropic-messages", provider: "anthropic", id: "test-model", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
 
 function fakeStream() {
 	const events = [];
@@ -69,6 +69,38 @@ const TOOL_FAILURE_PREFIX = /^[\w.:@/-]+ failed (?:(?:\(exit \d+\):)|(?:with exi
 
 describe("Claude Code login failures", () => {
 	const loginError = "Not logged in · Please run /login";
+	const assistant = (model, content) => ({
+		type: "assistant", error: "authentication_failed", session_id: "s", uuid: "u1",
+		message: { model, content, stop_reason: "stop_sequence", usage: { input_tokens: 0, output_tokens: 0 } },
+	});
+	// pi-atrium src/runtime/extension.ts reads content text before errorMessage.
+	const atriumFailureText = (output) => output.content.filter((b) => b.type === "text").map((b) => b.text).join("")
+		|| String(output.errorMessage ?? output.stopReason);
+
+	it("delivers the explanation to Atrium for the incident's synthetic assistant + result", async () => {
+		const c = makeCtx();
+		await consume(c, [
+			assistant("<synthetic>", [{ type: "text", text: loginError }]),
+			{ type: "result", subtype: "success", is_error: true, result: loginError },
+		]);
+		assert.equal(c.turnOutput.stopReason, "error");
+		assert.match(c.turnOutput.content[0].text, /钥匙串可能在等待授权/);
+		assert.ok(c.turnOutput.content[0].text.includes(loginError));
+		assert.equal(c.turnOutput.content[0].text, c.turnOutput.errorMessage);
+		assert.equal(atriumFailureText(c.turnOutput), c.turnOutput.errorMessage);
+		assert.ok(c.currentPiStream.events.some((e) => e.type === "text_delta" && e.delta === c.turnOutput.errorMessage));
+	});
+
+	it("never rewrites a normal model reply or a mixed synthetic reply", async () => {
+		for (const [model, content] of [
+			["claude-sonnet-4-5", [{ type: "text", text: loginError }]],
+			["<synthetic>", [{ type: "text", text: loginError }, { type: "text", text: "more" }]],
+		]) {
+			const c = makeCtx();
+			await consume(c, [assistant(model, content)]);
+			assert.deepEqual(c.turnOutput.content.map((b) => b.text), content.map((b) => b.text));
+		}
+	});
 
 	it("explains the actionable local permission check without claiming a known cause", async () => {
 		const c = makeCtx();

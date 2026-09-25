@@ -67,4 +67,4 @@ No build step — the package ships `src` TypeScript as-is (see `files` in `pack
 
 ## Tests
 
-Smoke tests typically need to run outside a sandbox because they access local pi/Claude settings and auth state.
+Smoke tests typically need to run outside a sandbox because they access local pi/Claude settings and auth state. When changing failure text, test the observed SDK message shape through the bridge's output and the consumer's extraction order to the user-visible failure; testing `errorMessage` alone misses content-first consumers such as Atrium when Claude sends a synthetic assistant message first.
