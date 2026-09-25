@@ -91,6 +91,7 @@ Config: `~/.pi/agent/claude-bridge.json` (global) or the project Pi config direc
 - `autoMemoryEnabled` — enable Claude Code's auto-memory system (default `false`)
 - `pathToClaudeCodeExecutable` — path to the `claude` binary. Useful if your OS/filesystem has the SDK's bundled musl/glibc binaries in a place where they can't run. For example, with Nix you can set the binary to e.g. `"/home/you/.nix-profile/bin/claude"`.
 
+**Shared Claude Code login on macOS:** Another Claude executable (for example, an SDK-bundled binary or `claude-agent-acp`) refreshing the same login may change Keychain access to its credential entry. Other executables can then receive `Not logged in` while macOS waits for permission. Check the Keychain prompt on that Mac and verify the requesting executable before choosing **Always Allow**. Re-running the bridge does not fix a pending permission prompt. A dedicated long-lived token is planned to avoid sharing this login (see [atrium#202](https://github.com/liu-zhengdong/atrium/issues/202)).
 
 **Startup notice:** the first interactive session to reach Claude Code lists whichever of `provider.plan` and `askClaude.enabled` you have left unset, then records `startupNoticeShown` (the date, `YYYY-MM-DD`) in the global config so it doesn't nag again.
 

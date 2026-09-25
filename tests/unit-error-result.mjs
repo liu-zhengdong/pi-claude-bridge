@@ -6,6 +6,8 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { isRetryableAssistantError } from "@earendil-works/pi-ai";
+import { errorMessage } from "../src/errors.js";
 import { QueryContext } from "../src/query-state.js";
 
 const { __test } = await import("../src/index.js");
@@ -64,6 +66,33 @@ describe("resultErrorText", () => {
 // from its retryable list, and the tool-failure shape it refuses to retry.
 const RETRYABLE = /rate\s*limit/i;
 const TOOL_FAILURE_PREFIX = /^[\w.:@/-]+ failed (?:(?:\(exit \d+\):)|(?:with exit code \d+))(?:\s|$)/i;
+
+describe("Claude Code login failures", () => {
+	const loginError = "Not logged in · Please run /login";
+
+	it("explains the actionable local permission check without claiming a known cause", async () => {
+		const c = makeCtx();
+		await consume(c, [{ type: "result", subtype: "success", is_error: true, result: loginError }]);
+		assert.match(c.turnOutput.errorMessage, /Not logged in/);
+		assert.match(c.turnOutput.errorMessage, /钥匙串可能在等待授权/);
+		assert.match(c.turnOutput.errorMessage, /确认请求的程序.*始终允许/);
+		assert.match(c.turnOutput.errorMessage, /长期令牌/);
+		assert.equal(c.turnOutput.stopReason, "error");
+		assert.equal(isRetryableAssistantError(c.turnOutput), false);
+	});
+
+	it("also handles a dedicated SDK error result and a thrown login error", () => {
+		assert.match(__test.resultErrorText({ type: "result", subtype: "error_during_execution", errors: [loginError] }), /钥匙串可能在等待授权/);
+		assert.match(errorMessage(new Error(loginError)), /钥匙串可能在等待授权/);
+	});
+
+	it("does not mislabel unrelated 401, invalid API key, or rate-limit errors", () => {
+		for (const other of ["Authentication required", "API Error: 401 invalid_api_key", "Invalid auth token", errorResult.result]) {
+			assert.equal(errorMessage(new Error(other)), other);
+			assert.equal(__test.resultErrorText({ type: "result", subtype: "success", is_error: true, result: other }), other);
+		}
+	});
+});
 
 describe("a rate-limited failure", () => {
 	// Claude Code words a subscription limit with none of the vocabulary anyone matches on,
