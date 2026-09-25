@@ -76,7 +76,7 @@ describe("Claude Code login failures", () => {
 		assert.match(c.turnOutput.errorMessage, /Not logged in/);
 		assert.match(c.turnOutput.errorMessage, /钥匙串可能在等待授权/);
 		assert.match(c.turnOutput.errorMessage, /确认请求的程序.*始终允许/);
-		assert.match(c.turnOutput.errorMessage, /长期令牌/);
+		assert.doesNotMatch(c.turnOutput.errorMessage, /长期令牌|#202/);
 		assert.equal(c.turnOutput.stopReason, "error");
 		assert.equal(isRetryableAssistantError(c.turnOutput), false);
 	});

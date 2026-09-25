@@ -10,7 +10,7 @@ import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 function explainLoginFailure(text: string): string {
 	const original = text.trim();
 	if (!/^Not logged in(?:\s*[·-]\s*(?:Please )?run \/login)?$/i.test(original)) return text;
-	return `读不到 Claude 登录（${original}）。如果在 Mac 上，钥匙串可能在等待授权；确认请求的程序是你使用的 Claude 后选择「始终允许」。也可改用长期令牌（#202）。`;
+	return `读不到 Claude 登录（${original}）。如果在 Mac 上，钥匙串可能在等待授权；确认请求的程序是你使用的 Claude 后选择「始终允许」。`;
 }
 
 export function errorMessage(err: unknown): string {
