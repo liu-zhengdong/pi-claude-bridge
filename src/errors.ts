@@ -4,15 +4,24 @@
 
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 
+/** Explain the confirmed login error without assuming why Claude Code cannot read it.
+ * A bare 401 or "Authentication required" can also come from an API or remote
+ * settings request, so do not tell those callers to approve a Keychain prompt. */
+export function explainLoginFailure(text: string): string {
+	const original = text.trim();
+	if (!/^Not logged in(?:\s*[·-]\s*(?:Please )?run \/login)?$/i.test(original)) return text;
+	return `读不到 Claude 登录（${original}）。如果在 Mac 上，钥匙串可能在等待授权；确认请求的程序是你使用的 Claude 后选择「始终允许」。`;
+}
+
 export function errorMessage(err: unknown): string {
-	if (err instanceof Error) return err.message;
+	if (err instanceof Error) return explainLoginFailure(err.message);
 	if (err && typeof err === "object") {
 		const obj = err as Record<string, unknown>;
-		if (typeof obj.message === "string") return obj.message;
-		if (typeof obj.error === "string") return obj.error;
+		if (typeof obj.message === "string") return explainLoginFailure(obj.message);
+		if (typeof obj.error === "string") return explainLoginFailure(obj.error);
 		try { return JSON.stringify(err); } catch {}
 	}
-	return String(err);
+	return explainLoginFailure(String(err));
 }
 
 /** Failure text for an SDK result, or undefined when it succeeded. CC reports API failures
@@ -20,9 +29,9 @@ export function errorMessage(err: unknown): string {
  *  result; the dedicated error subtypes carry `errors` instead. */
 export function resultErrorText(message: SDKMessage): string | undefined {
 	const result = message as SDKMessage & { subtype?: string; is_error?: boolean; result?: string; errors?: unknown; error?: unknown };
-	if (result.subtype === "success") return result.is_error ? result.result || "Claude Code reported an error" : undefined;
-	if (Array.isArray(result.errors) && result.errors.length) return result.errors.map(String).join("\n");
-	if (typeof result.error === "string") return result.error;
+	if (result.subtype === "success") return result.is_error ? explainLoginFailure(result.result || "Claude Code reported an error") : undefined;
+	if (Array.isArray(result.errors) && result.errors.length) return explainLoginFailure(result.errors.map(String).join("\n"));
+	if (typeof result.error === "string") return explainLoginFailure(result.error);
 	return `Claude Code failed: ${result.subtype ?? "unknown result"}`;
 }
 

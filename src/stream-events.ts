@@ -10,7 +10,7 @@ import type { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import type { AssistantMessageEventStream, Model } from "@earendil-works/pi-ai";
 import { appendFileSync } from "fs";
 import { RECORD_STREAM_PATH, debug, diagDump } from "./debug.js";
-import { describeRateLimitFailure, resultErrorText } from "./errors.js";
+import { describeRateLimitFailure, explainLoginFailure, resultErrorText } from "./errors.js";
 import type { McpResult } from "./extract-tool-results.js";
 import { mapStopReason, mapToolArgs, parsePartialJson, piToolNameFor, servedModelId } from "./mapping.js";
 import { userMessage, type PromptStream } from "./prompt-stream.js";
@@ -246,15 +246,24 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
 		return;
 	}
 	c.turnToolCallIds = [];
+	// Claude emits an authentication failure as a standalone synthetic assistant
+	// message before the errored result. Atrium prefers content over errorMessage,
+	// so explaining only the result leaves the user with the unhelpful raw text.
+	// Never rewrite normal model output or one block of a mixed reply.
+	const syntheticLoginText = assistantMsg.model === "<synthetic>" && assistantMsg.content.length === 1
+		&& assistantMsg.content[0].type === "text" && typeof assistantMsg.content[0].text === "string"
+		? explainLoginFailure(assistantMsg.content[0].text)
+		: undefined;
 	debug(`processAssistantMessage fallback: ${assistantMsg.content.length} blocks, types=${assistantMsg.content.map((b: any) => b.type).join(",")}`);
 	for (const block of assistantMsg.content) {
 		if (block.type === "text" && block.text) {
+			const text = syntheticLoginText ?? block.text;
 			ensureTurnStarted(c);
-			c.turnBlocks.push({ type: "text", text: block.text });
+			c.turnBlocks.push({ type: "text", text });
 			const idx = c.turnBlocks.length - 1;
 			c.currentPiStream?.push({ type: "text_start", contentIndex: idx, partial: c.turnOutput });
-			c.currentPiStream?.push({ type: "text_delta", contentIndex: idx, delta: block.text, partial: c.turnOutput });
-			c.currentPiStream?.push({ type: "text_end", contentIndex: idx, content: block.text, partial: c.turnOutput });
+			c.currentPiStream?.push({ type: "text_delta", contentIndex: idx, delta: text, partial: c.turnOutput });
+			c.currentPiStream?.push({ type: "text_end", contentIndex: idx, content: text, partial: c.turnOutput });
 		} else if (block.type === "thinking") {
 			ensureTurnStarted(c);
 			c.turnBlocks.push({ type: "thinking", thinking: block.thinking ?? "", thinkingSignature: block.signature ?? "" });

@@ -597,7 +597,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				queryCtx.turnOutput.stopReason = options?.signal?.aborted ? "aborted" : "error";
 				// The SDK drops its copy of the result text if any message follows the error
 				// result, so prefer the cause consumeQuery recorded off the result itself.
-				queryCtx.turnOutput.errorMessage ??= error instanceof Error ? error.message : String(error);
+				queryCtx.turnOutput.errorMessage ??= errorMessage(error);
 			}
 			if (!isReentrant && queryCtx.activeQuery === sdkQuery) {
 				queryCtx.releasePendingToolCalls("Query ended");
