@@ -22,6 +22,7 @@ import { buildMcpServers, reportLeaks, streamProviderEntry, streamSideRequest } 
 import { applyRuntimeConfig, getPiSessionId, setPiMode, setPiSessionId, setPiUI } from "./runtime-config.js";
 import { clearSharedSession, getSharedSession, markNeedsRebuild, orphanedToolResultAction, setSharedSession, type SessionState } from "./session-store.js";
 import { buildSideRequestSession, ownsSharedSession, syncSharedSession } from "./session-sync.js";
+import { hasClaudeCodeSetupToken } from "./setup-token.js";
 import { queueStartupNotice } from "./startup-notice.js";
 import { consumeQuery, deliverToolResults, drainForAbort, finalizeCurrentStream } from "./stream-events.js";
 import { bindUsageAdapter, claimUsageAdapter, refreshClaudeUsage, releaseUsageAdapter, setUsageControlQueryForTest } from "./usage.js";
@@ -94,6 +95,15 @@ export const __test = {
 };
 
 export default function (pi: ExtensionAPI) {
+	// The Pi host probes get_commands before any turn in token mode. Old bridge
+	// versions have no marker, so a mixed-version launch fails rather than using
+	// the machine's Claude login. No token value is exposed by the marker.
+	if (hasClaudeCodeSetupToken()) {
+		pi.registerCommand("claude-bridge-token-ready-v1", {
+			description: "Claude 独立令牌模式就绪",
+			handler: async () => {},
+		});
+	}
 	// Disable non-essential Claude Code traffic (update checks, MCP registry, telemetry)
 	process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
 
