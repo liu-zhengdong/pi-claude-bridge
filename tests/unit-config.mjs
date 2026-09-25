@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readFileSync } from "node:fs";
@@ -9,16 +9,41 @@ import { claudeCodeSettings, loadConfig, markStartupNoticeShown } from "../src/c
 
 function withTempHome(fn) {
 	const oldHome = process.env.HOME;
+	const oldAgentDir = process.env.PI_CODING_AGENT_DIR;
 	const home = mkdtempSync(join(tmpdir(), "claude-bridge-home-"));
 	try {
 		process.env.HOME = home;
+		// Pi honors this override before HOME. Without it, a unit test launched
+		// from Pi writes fixtures into the caller's real claude-bridge.json.
+		process.env.PI_CODING_AGENT_DIR = join(home, ".pi", "agent");
 		return fn(home);
 	} finally {
 		if (oldHome === undefined) delete process.env.HOME;
 		else process.env.HOME = oldHome;
+		if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = oldAgentDir;
 		rmSync(home, { recursive: true, force: true });
 	}
 }
+
+describe("config test isolation", () => {
+	it("never writes the invoking Pi's agent directory", () => {
+		const callerDir = mkdtempSync(join(tmpdir(), "claude-bridge-caller-agent-"));
+		const oldAgentDir = process.env.PI_CODING_AGENT_DIR;
+		try {
+			process.env.PI_CODING_AGENT_DIR = callerDir;
+			withTempHome((home) => {
+				assert.equal(getAgentDir(), join(home, ".pi", "agent"));
+				markStartupNoticeShown();
+			});
+			assert.deepEqual(readdirSync(callerDir), []);
+		} finally {
+			if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = oldAgentDir;
+			rmSync(callerDir, { recursive: true, force: true });
+		}
+	});
+});
 
 describe("claudeCodeSettings", () => {
 	it("disables auto-memory by default", () => {
