@@ -103,10 +103,21 @@ describe("extensionAdditions", () => {
 		assert.match(result.problem, /rewrote/);
 	});
 
-	it("reports text put ahead of pi's assembly, still forwarding what follows it", () => {
+	it("forwards extension text before a child custom prompt without pi's harness", () => {
+		const parentOpts = options();
+		const parent = buildSystemPrompt(parentOpts);
+		const childOpts = options({ customPrompt: `${parent}\n\n<sub_agent_context>be brief</sub_agent_context>` });
+		const prefix = "You are a child subagent, not the parent orchestrator.";
+		const prompt = append(`${prefix}\n\n${buildSystemPrompt(childOpts)}`, NOTES);
+		const result = extensionAdditions(prompt, childOpts);
+		assert.deepEqual(result, { before: prefix, text: NOTES });
+	});
+
+	it("does not infer a prefix if the custom prompt was rewritten", () => {
 		const opts = options();
-		const prompt = append(`PREFIX\n\n${buildSystemPrompt(opts)}`, NOTES);
+		const prompt = append("PREFIX\n\nPi content without the custom prompt\n\n<cwd>\n/work/repo\n</cwd>", NOTES);
 		const result = extensionAdditions(prompt, opts);
+		assert.equal(result.before, undefined);
 		assert.equal(result.text, NOTES);
 		assert.match(result.problem, /ahead of pi's assembly/);
 	});
@@ -129,6 +140,28 @@ describe("before_agent_start forwards extension text", () => {
 		assert.ok(projected.includes("global rules"), "context files still forwarded");
 		assert.ok(projected.endsWith(`${NOTES}\n\n${ACP}`), "extension text follows the portable parts");
 		assert.ok(!projected.includes("<cwd>"), "pi's own cwd section stays out");
+	});
+
+	it("projects child prefix, parent rules and appended text in order, not pi's harness", () => {
+		const handlers = activateWithMockPi();
+		const parentOpts = options();
+		const parent = buildSystemPrompt(parentOpts);
+		handlers.get("before_agent_start")({ systemPrompt: parent, systemPromptOptions: parentOpts }, {});
+		const childOpts = options({ customPrompt: `${parent}\n\n<sub_agent_context>be brief</sub_agent_context>` });
+		const prefix = "You are a child subagent, not the parent orchestrator.";
+		const prompt = append(`${prefix}\n\n${buildSystemPrompt(childOpts)}`, NOTES);
+		const notices = [];
+		handlers.get("before_agent_start")(
+			{ systemPrompt: prompt, systemPromptOptions: forced(childOpts, prompt) },
+			{ ui: { notify: (message) => notices.push(message) } },
+		);
+		const projected = projectPromptCapture(__test.promptCaptures.resolveOrDerive(prompt), { skillReadTool: "mcp" });
+		assert.ok(projected.startsWith(prefix));
+		assert.match(projected, /global rules/);
+		assert.match(projected, /be brief/);
+		assert.ok(projected.endsWith(NOTES));
+		assert.ok(!projected.includes("<cwd>"));
+		assert.deepEqual(notices, []);
 	});
 
 	it("warns once when part of the prompt cannot be accounted for, and diagnoses it", () => {
