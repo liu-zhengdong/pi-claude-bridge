@@ -8,6 +8,6 @@
 
 ## 2026-09-25 · 报错验证走到消费者
 
-- 发生：#202 首轮仅测 `errorMessage` 已映射，却漏掉事故里的 synthetic 助手正文；Atrium 的 `content || errorMessage` 仍把原始错误给用户，严正验收退回，Iris 要求纳入自查。
+- 发生：#202 首轮仅测 `errorMessage` 已映射，却漏掉事故里的 synthetic 助手正文；pi-atrium 的 `text || errorMessage` 仍把原始错误给用户，严正验收退回，Iris 要求纳入自查。
 - 分析：原 Tests 只有烟雾测试环境说明，没有报错交付的观察点。上游模型消息与下游提取顺序都会决定用户最终看到什么。
 - 改变：在 Tests 段明确按实际 SDK 形态、bridge 输出及消费者提取顺序验证用户可见失败文案；不把单一字段的单测当成完整链路。
