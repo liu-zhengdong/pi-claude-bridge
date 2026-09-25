@@ -81,6 +81,7 @@ export function createPromptRecorder() {
 			append: options?.appendSystemPrompt,
 			contextFiles: options?.contextFiles ?? [],
 			skills: hasRead ? options?.skills ?? [] : [],
+			extensionsBefore: additions.before,
 			extensions: additions.text,
 		});
 		if (additions.problem && !diagnosed.has(additions.problem)) {

@@ -10,6 +10,8 @@ export type PromptCaptureInput = {
 	append?: string;
 	contextFiles: { path: string; content: string }[];
 	skills: Skill[];
+	/** What extensions put before pi's assembly; see prompt-extensions.ts. */
+	extensionsBefore?: string;
 	/** What other extensions added to pi's assembly; see prompt-extensions.ts. */
 	extensions?: string;
 };
@@ -84,6 +86,7 @@ export class PromptCaptures {
 
 		capture.custom = input.custom;
 		capture.append = input.append;
+		capture.extensionsBefore = input.extensionsBefore;
 		capture.extensions = input.extensions;
 		capture.contextFiles = input.contextFiles.map((file) => ({ ...file }));
 		capture.skills = [...input.skills];
@@ -289,6 +292,7 @@ function projectCapture(
 
 		const custom = projectCustom(capture, options, visiting);
 		const parts = [
+			capture.extensionsBefore,
 			formatProjectContext(capture.contextFiles),
 			renderSkillsBlock(ownSkills, options.skillReadTool),
 			custom,

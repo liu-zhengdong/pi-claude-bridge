@@ -5,10 +5,11 @@
 // `systemPrompt: event.systemPrompt + "\n\n" + text` from before_agent_start
 // leaves no trace in those options, only in the rendered string — Pi Notes
 // appends the user's default-open notes that way, billion-context-pi its tool
-// guide. Pi carries such a return as `forceSystemPrompt`, and it is still pi's
-// rendering with their text after it: pi renders its own sections first, `<cwd>`
-// last among them, then any custom sections new to its map, joining all of them
-// with a blank line. So whatever follows is the extensions'.
+// guide. Pi carries such a return as `forceSystemPrompt`. A child extension can
+// also prepend role instructions before the custom prompt that embeds its parent.
+// Pi renders its own sections first, `<cwd>` last among them, then any custom
+// sections new to its map, joining all of them with a blank line. The custom
+// prompt and `<cwd>` delimit the extension text on either side.
 
 export type AssemblyOptions = {
 	customPrompt?: string;
@@ -17,6 +18,8 @@ export type AssemblyOptions = {
 };
 
 export type ExtensionAdditions = {
+	/** Extension text before a fully located custom prompt. */
+	before?: string;
 	/** Custom sections as pi renders them, then the text appended after pi's assembly. */
 	text?: string;
 	/** Why part of the prompt could not be accounted for. That part is not forwarded. */
@@ -35,11 +38,14 @@ export function extensionAdditions(prompt: string, options: AssemblyOptions | un
 	if (!cwd) return { problem: "pi's assembly has no cwd section to locate its end by" };
 	const cwdSection = renderSection("cwd", cwd);
 
-	// A subagent's custom prompt embeds its parent's whole prompt, `<cwd>` and all, so
-	// the search starts after it.
+	// A subagent's custom prompt embeds its parent's whole prompt, `<cwd>` and all.
+	// Locate that whole custom prompt even if an extension put text ahead of it;
+	// start the cwd search after it, not at the parent's embedded cwd.
 	const customPrompt = options.customPrompt || undefined;
-	const startsWithCustom = customPrompt !== undefined && prompt.startsWith(customPrompt);
-	const at = prompt.indexOf(cwdSection, startsWithCustom ? customPrompt.length : 0);
+	const customAt = customPrompt === undefined ? -1 : prompt.indexOf(customPrompt);
+	const before = customAt > 0 ? prompt.slice(0, customAt).trim() : undefined;
+	const afterCustom = customPrompt !== undefined && customAt >= 0 ? customAt + customPrompt.length : 0;
+	const at = prompt.indexOf(cwdSection, afterCustom);
 	if (at === -1) return { problem: "pi's cwd section is missing from the prompt, so an extension rewrote it" };
 
 	// Custom sections new to pi's map follow `<cwd>` in insertion order. One named like
@@ -57,8 +63,9 @@ export function extensionAdditions(prompt: string, options: AssemblyOptions | un
 
 	const text = [...sections, prompt.slice(end).trim()].filter(Boolean).join("\n\n");
 	return {
+		...(before ? { before } : {}),
 		...(text ? { text } : {}),
-		...(customPrompt !== undefined && !startsWithCustom
+		...(customPrompt !== undefined && customAt === -1
 			? { problem: "an extension put text ahead of pi's assembly" }
 			: {}),
 	};
