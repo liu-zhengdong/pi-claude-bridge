@@ -21,6 +21,7 @@ import { collectPromptSkills } from "./prompt-capture.js";
 import { promptCaptures } from "./prompt-record.js";
 import { getLongContextSettings, getPiSessionId, getProviderSettings, resolveModel, setAskClaudeToolName } from "./runtime-config.js";
 import { syncSharedSession } from "./session-sync.js";
+import { hasClaudeCodeSetupToken } from "./setup-token.js";
 import { renderSkillsBlock } from "./skills.js";
 
 // AskClaude mode presets — controls which CC tools are blocked per mode.
@@ -88,8 +89,14 @@ async function promptAndWait(
 		resumeSessionId = syncSharedSession(contextWithPrompt as Context["messages"], cwd, undefined, cliModel).sessionId;
 	}
 
-	// Mode → disallowed tools
-	const disallowedTools = MODE_DISALLOWED_TOOLS[mode] ?? [];
+	// A Claude Code child in a token identity receives the token in its env.
+	// Native Bash/Agent/Skill/hooks (and Agent's descendants) could inherit it.
+	const tokenIdentity = hasClaudeCodeSetupToken();
+	if (tokenIdentity && mode === "full")
+		throw new Error("独立令牌身份不能运行 AskClaude full：Claude 原生工具可能把令牌传给子进程。改用 mode=read 或 mode=none 提问；需要写入或执行命令时请使用 Pi 自己的工具");
+	const disallowedTools = tokenIdentity && mode === "read"
+		? [...MODE_DISALLOWED_TOOLS.read, "Agent", "Skill"]
+		: MODE_DISALLOWED_TOOLS[mode] ?? [];
 
 	// AskClaude uses Claude Code's native Read tool rather than Pi's MCP bridge.
 	// Same resolver as the provider path: a prompt neither recorded nor derivable
@@ -135,6 +142,9 @@ async function promptAndWait(
 			env: childEnv(process.env, getPiSessionId()),
 			permissionMode: "bypassPermissions",
 			settings: { ...claudeCodeSettings(getProviderSettings()), claudeMdExcludes: CLAUDE_MD_EXCLUDES },
+			// An explicit allowlist keeps Agent/subprocess-capable native tools out
+			// even if a future Claude Code version ignores disallowedTools.
+			...(tokenIdentity ? { tools: mode === "read" ? ["Read", "Glob", "Grep"] : [] } : {}),
 			skills: [],
 			...(disallowedTools.length ? { disallowedTools } : {}),
 			...(effort ? { effort } : {}),
@@ -142,7 +152,7 @@ async function promptAndWait(
 			// without the tool and permission guidance the bridge relies on everywhere else.
 			// Whether pi has skills to append is unrelated to whether the child needs that.
 			systemPrompt: { type: "preset", preset: "claude_code", append: skillsBlock },
-			settingSources: ["user", "project"] as SettingSource[],
+			settingSources: tokenIdentity ? [] as SettingSource[] : ["user", "project"] as SettingSource[],
 			extraArgs,
 			...(resumeSessionId ? { resume: resumeSessionId } : {}),
 			...(options?.isolated ? { persistSession: false } : {}),
@@ -241,8 +251,9 @@ async function promptAndWait(
  *  recorded would leave it forwarding a tool pi serves itself. */
 export function registerAskClaudeTool(pi: ExtensionAPI, config: Config): void {
 	const askConf = config.askClaude;
-	const allowFull = askConf?.allowFullMode !== false;
-	const defaultMode = askConf?.defaultMode ?? "read";
+	const allowFull = askConf?.allowFullMode !== false && !hasClaudeCodeSetupToken();
+	const defaultMode = hasClaudeCodeSetupToken() && askConf?.defaultMode === "full"
+		? "read" : askConf?.defaultMode ?? "read";
 	const defaultIsolated = askConf?.defaultIsolated ?? false;
 	setAskClaudeToolName(askConf?.name ?? "AskClaude");
 
@@ -319,6 +330,11 @@ export function registerAskClaudeTool(pi: ExtensionAPI, config: Config): void {
 				}
 
 				const mode = (params.mode ?? defaultMode) as "full" | "read" | "none";
+				if (hasClaudeCodeSetupToken() && mode === "full")
+					return {
+						content: [{ type: "text" as const, text: "独立令牌身份不能运行 AskClaude full：Claude 原生工具可能把令牌传给子进程。改用 mode=read 或 mode=none 提问；需要写入或执行命令时请使用 Pi 自己的工具" }],
+						details: { error: true },
+					};
 				const isolated = params.isolated ?? defaultIsolated;
 				const toolCalls = new Map<string, ToolCallState>();
 				const start = Date.now();

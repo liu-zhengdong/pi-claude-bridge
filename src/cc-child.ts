@@ -6,6 +6,7 @@
 // shared; here there is nothing to reach for.
 
 import type { EffortLevel } from "@anthropic-ai/claude-agent-sdk";
+import { claudeCodeSetupToken } from "./setup-token.js";
 
 // Applied to every Claude Code subprocess the bridge spawns — provider, AskClaude
 // and the compact summary. One place, so a guard is added once rather than three
@@ -33,6 +34,9 @@ export const CC_CHILD_ENV = {
 export function childEnv(base: NodeJS.ProcessEnv, captured: string | undefined): Record<string, string | undefined> {
 	return {
 		...base,
+		// Never inherit a later ambient value or fall back to shared local login
+		// when an assigned setup-token was empty at identity startup.
+		CLAUDE_CODE_OAUTH_TOKEN: claudeCodeSetupToken(),
 		AGENT_SESSION_ID: captured?.trim() || undefined,
 		...CC_CHILD_ENV,
 	};

@@ -53,6 +53,8 @@ You could also create skills or add something to AGENTS.md to e.g. "Always call 
 - **`thinking`** — effort level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`
 - **`isolated`** — when `true`, Claude gets a clean session with no conversation history (default: `false`)
 
+**Assigned setup-token identities:** `mode: "full"` is disabled even when `allowFullMode` is true; a forced call is rejected. `read` is limited to Claude's native Read, Glob and Grep (no Agent/subagents), and `none` has no Claude-native tools. Use Pi's own tools for execution or editing. These restrictions prevent Claude-native Bash/Agent and user/project hooks from launching descendants with the token, but they are not an OS sandbox: tools with filesystem access can still read files their process is allowed to read. See [the follow-up issue](https://github.com/liu-zhengdong/pi-claude-bridge/issues/32) for restoring safe native-tool access. Identities using the shared local Claude Code login keep their existing AskClaude modes.
+
 ## Configuration
 
 Config: `~/.pi/agent/claude-bridge.json` (global) or the project Pi config directory, usually `.pi/claude-bridge.json` (project; merged over global).
@@ -99,11 +101,11 @@ Config: `~/.pi/agent/claude-bridge.json` (global) or the project Pi config direc
 
 ## Tests
 
-`npm run test:unit` for offline tests (`tests/unit-*.mjs`: queue, import, skills, model discovery). 
+Before running any test command, inspect its `package.json` script and any scripts it invokes for external authentication, network calls, and side effects. `npm test` (or `npm run test:unit`) runs only offline unit tests (`tests/unit-*.mjs`). It does **not** prove end-to-end model behavior.
 
-`npm test` for the full suite, which adds integration tests that hit APIs (`tests/int-*.{sh,mjs}`: smoke, multi-turn, cache, session-resume, session-rebuild, tool-message). Set `CLAUDE_BRIDGE_TESTING_ALT_MODEL` in `.env.test` for the alt-provider smoke test (e.g. `openrouter/z-ai/glm-4.7-flash`).
+`npm run test:int` explicitly runs integration tests (`tests/int-*.{sh,mjs}`: smoke, multi-turn, cache, session-resume, session-rebuild, tool-message) that call real APIs using the invoking user's Claude Code login. Do not run it against a shared login during credential work; use an isolated HOME, a dedicated test account, or fake local services according to the task's authorization. Set `CLAUDE_BRIDGE_TESTING_ALT_MODEL` in `.env.test` for the alt-provider smoke test (e.g. `openrouter/z-ai/glm-4.7-flash`).
 
-Integration tests spawn real `pi` and Claude Code subprocesses, so they need write access to `~/.claude` for CC's session state — a sandbox that blocks it makes the next turn's `--resume` fail with `No conversation found with session ID`. The RPC harness probes for this at startup and fails fast.
+Integration tests spawn real `pi` and Claude Code subprocesses, so they need write access to their isolated `~/.claude` for CC's session state — a sandbox that blocks it makes the next turn's `--resume` fail with `No conversation found with session ID`. The RPC harness probes for this at startup and fails fast.
 
 ## Debugging
 
