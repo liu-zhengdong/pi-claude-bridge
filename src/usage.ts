@@ -10,6 +10,7 @@ import { calculateCost, type AssistantMessage, type Model } from "@earendil-work
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CLAUDE_MD_EXCLUDES, childEnv } from "./cc-child.js";
 import { claudeCodeSettings, loadConfig, type Config } from "./config.js";
+import { hasClaudeCodeSetupToken } from "./setup-token.js";
 import { debug, makeCliDebugOptions } from "./debug.js";
 import {
 	registerClaudeUsageAdapter,
@@ -167,7 +168,7 @@ export async function refreshClaudeUsage(
 				? abortController.signal.reason
 				: new Error("Claude usage refresh aborted.");
 		}
-		const strictMcpConfig = dependencies.provider.strictMcpConfig !== false;
+		const strictMcpConfig = hasClaudeCodeSetupToken() || dependencies.provider.strictMcpConfig !== false;
 		const claudeExecutable = dependencies.provider.pathToClaudeCodeExecutable;
 		sdkQuery = dependencies.query({
 			prompt: emptyUsagePrompt(),
@@ -176,6 +177,7 @@ export async function refreshClaudeUsage(
 				env: dependencies.env,
 				abortController,
 				tools: [],
+				...(hasClaudeCodeSetupToken() ? { settingSources: [] as const } : {}),
 				strictMcpConfig,
 				skills: [],
 				persistSession: false,

@@ -34,6 +34,7 @@ import { adoptSession, clearSharedSession, getDeliveredToolResultCursor, getShar
 import { buildSideRequestSession, ownsSharedSession, syncSharedSession, type SyncResult } from "./session-sync.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX } from "./skills.js";
 import { showStartupNoticeOnce } from "./startup-notice.js";
+import { hasClaudeCodeSetupToken } from "./setup-token.js";
 import { claimCurrentPiStream, consumeQuery, deliverToolResults, drainForAbort, finalizeCurrentStream, markStreamComplete } from "./stream-events.js";
 
 // Global (not query state):
@@ -419,9 +420,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// MCP auto-loading suppression: CC reads MCP servers from ~/.claude.json (top-level
 	// + per-project) and .mcp.json. Since pi executes tools (not CC), those are pure
 	// token overhead. --strict-mcp-config tells the binary to use ONLY mcpServers passed
-	// programmatically and ignore filesystem MCP entries — applied unconditionally because
-	// settingSources is left at CC's default, which loads all sources.
-	const strictMcpConfigEnabled = getProviderSettings().strictMcpConfig !== false;
+	// programmatically and ignore filesystem MCP entries. The default for shared-login
+	// identities loads filesystem settings; token identities suppress them explicitly.
+	const strictMcpConfigEnabled = hasClaudeCodeSetupToken() || getProviderSettings().strictMcpConfig !== false;
 	const claudeExecutable = getProviderSettings().pathToClaudeCodeExecutable;
 
 	// Prefer the model's own thinkingLevelMap when present (pi-ai 0.72+ ships
@@ -452,6 +453,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		cwd,
 		env: childEnv(process.env, getPiSessionId()),
 		tools: [],
+		// Token identities must not load filesystem hooks or MCP servers whose
+		// subprocesses would inherit Claude Code's credential.
+		...(hasClaudeCodeSetupToken() ? { settingSources: [] as const } : {}),
 		permissionMode: "bypassPermissions",
 		includePartialMessages: true,
 		// includeGitInstructions:false drops the gitStatus block from the preset.

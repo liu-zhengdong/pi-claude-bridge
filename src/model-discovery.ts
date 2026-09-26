@@ -26,6 +26,7 @@ import { query } from "@anthropic-ai/claude-agent-sdk";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { CLAUDE_MD_EXCLUDES, childEnv } from "./cc-child.js";
 import { claudeCodeSettings, type Config } from "./config.js";
+import { hasClaudeCodeSetupToken } from "./setup-token.js";
 import { debug, makeCliDebugOptions } from "./debug.js";
 import { buildModelCatalog } from "./runtime-config.js";
 
@@ -199,7 +200,7 @@ export async function probeModelIds(options: ModelProbeOptions): Promise<string[
 				? abortController.signal.reason
 				: new Error("Claude model probe aborted.");
 		}
-		const strictMcpConfig = provider.strictMcpConfig !== false;
+		const strictMcpConfig = hasClaudeCodeSetupToken() || provider.strictMcpConfig !== false;
 		sdkQuery = sdkQueryImpl({
 			prompt: emptyDiscoveryPrompt(),
 			options: {
@@ -207,6 +208,7 @@ export async function probeModelIds(options: ModelProbeOptions): Promise<string[
 				env: childEnv(process.env, undefined),
 				abortController,
 				tools: [],
+				...(hasClaudeCodeSetupToken() ? { settingSources: [] as const } : {}),
 				strictMcpConfig,
 				skills: [],
 				persistSession: false,
